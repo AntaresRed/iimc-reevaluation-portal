@@ -1,0 +1,23 @@
+{
+  "requests": [
+    {
+      "id": "IIMC-MN38FP6Y-V2DW",
+      "studentEmail": "anuj@email.iimcal.ac.in",
+      "studentName": "Anuj Anil Kapse",
+      "regNo": "MBA/161/62",
+      "professorName": "Prof. Dharma Raju Bathini",
+      "subject": "Management Game",
+      "section": "C",
+      "examType": "End Term",
+      "term": "Term 2",
+      "questions": "Q1",
+      "reason": "Because I said so",
+      "paymentFileName": "WIN_20260323_17_58_06_Pro.jpg",
+      "status": "Resolved - No Change",
+      "createdAt": 1774273171786,
+      "updatedMarks": "Q1",
+      "professorRemarks": "I didn't want to increase lmaoooo",
+      "reviewedAt": 1774273213844
+    }
+  ]
+}

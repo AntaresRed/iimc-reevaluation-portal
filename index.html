@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>IIM Calcutta — Re-Evaluation Portal</title>
+  <meta name="description"
+    content="Official exam re-evaluation submission portal for IIM Calcutta students and faculty." />
+
+  <!-- Open Graph / Social Media Preview -->
+  <meta property="og:type" content="website" />
+  <meta property="og:url" content="https://iimc-reevaluation-antares.netlify.app/" />
+  <meta property="og:title" content="IIM Calcutta — Re-Evaluation Portal" />
+  <meta property="og:description" content="Secure, transparent exam re-evaluation submission portal for IIM Calcutta students and faculty. Sign in with your @email.iimcal.ac.in Google account." />
+  <meta property="og:image" content="https://iimc-reevaluation-antares.netlify.app/assets/browser_logo.png" />
+
+  <!-- Twitter Card -->
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="IIM Calcutta — Re-Evaluation Portal" />
+  <meta name="twitter:description" content="Secure, transparent exam re-evaluation submission portal for IIM Calcutta students and faculty." />
+  <meta name="twitter:image" content="https://iimc-reevaluation-antares.netlify.app/assets/browser_logo.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap"
+    rel="stylesheet" />
+  <link rel="icon" type="image/png" href="assets/browser_logo.png" />
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+</head>
+
+<body>
+
+  <!-- ========== LOGIN PAGE ========== -->
+  <div id="page-login" class="page active">
+    <div class="login-bg">
+      <div class="login-left">
+        <div class="joka-watermark" aria-hidden="true">JOKA&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC&nbsp;&nbsp;JOKA&nbsp;&nbsp;IIMC</div>
+        <div class="login-brand">
+          <div class="brand-logo">
+            <img src="assets/iimcal-logo.png" alt="IIM Calcutta" onerror="this.style.display='none'" />
+            <div class="brand-text">
+              <span class="brand-iim">IIM</span>
+              <span class="brand-calcutta">CALCUTTA</span>
+            </div>
+          </div>
+          <h1 class="login-headline">Re-Evaluation<br />Submission Portal</h1>
+          <p class="login-tagline">In Joka, we leave no marks behind...</p>
+          <p class="login-sub">A secure, transparent system for exam re-evaluation requests...<br/>A Proof-of-Concept.</p>
+          <!-- Rotating Joka Wisdom quotes -->
+          <div class="joka-quotes-box">
+            <span class="joka-quotes-label">💡 Joka Wisdom</span>
+            <p class="joka-quote" id="joka-quote"></p>
+          </div>
+        </div>
+      </div>
+      <div class="login-right">
+        <div class="login-card">
+          <div class="login-card-logo">
+            <div class="portal-icon">🎓</div>
+            Sign in to IIM Calcutta Portal
+          </div>
+          <p class="login-domain-note">Only <strong>@email.iimcal.ac.in</strong> accounts are permitted</p>
+
+          <div class="google-signin-wrapper">
+            <p class="signin-hint">Your role (Student / Faculty) is automatically detected from your Google account.</p>
+            <div id="google-signin-btn"></div>
+            <div class="input-error" id="google-auth-error"></div>
+          </div>
+
+          <!-- DEV-ONLY: Faculty quick-login bypass -->
+          <div class="creds-panel">
+            <button class="creds-toggle" onclick="toggleCreds(this)">
+              🛠️ [DEV] Faculty Test Login <span class="creds-arrow">▼</span>
+            </button>
+            <div class="creds-list" id="creds-list" style="display:none">
+              <p class="creds-note-dev">⚠️ Bypasses Google OAuth — remove before production</p>
+              <div id="creds-entries"></div>
+            </div>
+          </div>
+
+          <div class="login-footer">
+            <span>🔒</span>
+            <span>Secured by Google OAuth 2.0</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== STUDENT DASHBOARD ========== -->
+  <div id="page-student" class="page">
+    <nav class="navbar">
+      <div class="nav-brand">
+        <div class="nav-logo">IIM<span>C</span></div>
+        <span class="nav-title">Re-Evaluation Portal</span>
+        <span class="batch-badge" id="student-batch-badge"></span>
+      </div>
+      <div class="nav-right">
+        <button class="btn-peaceful" id="peaceful-toggle-student" onclick="togglePeaceful()" title="Toggle Peaceful Mode">🧘 Peaceful</button>
+        <div class="nav-user" id="student-nav-user"></div>
+        <button class="btn-signout" onclick="signOut()">Sign Out</button>
+      </div>
+    </nav>
+
+    <div class="dashboard-container">
+      <div class="dashboard-header">
+        <div>
+          <h2 class="dashboard-title">Student Dashboard</h2>
+          <p class="dashboard-subtitle" id="student-welcome"></p>
+        </div>
+        <button class="btn-primary" onclick="showStudentForm()">
+          <span>+</span> New Re-Evaluation Request
+        </button>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row" id="student-stats"></div>
+
+      <!-- Tabs -->
+      <div class="tab-bar">
+        <button class="tab active" onclick="switchStudentTab('pending', this)">Pending</button>
+        <button class="tab" onclick="switchStudentTab('review', this)">Under Review</button>
+        <button class="tab" onclick="switchStudentTab('resolved', this)">Resolved</button>
+        <button class="tab" onclick="switchStudentTab('all', this)">All Requests</button>
+      </div>
+
+      <div class="requests-grid" id="student-requests-grid">
+        <div class="empty-state">
+          <div class="empty-icon">📋</div>
+          <p>No re-evaluation requests yet.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Student Form Modal -->
+    <div id="student-form-modal" class="modal-overlay">
+      <div class="modal-box modal-wide">
+        <div class="modal-header">
+          <div>
+            <h3>New Re-Evaluation Request</h3>
+            <p class="modal-sub">Fill all fields carefully. Incomplete forms will not be accepted.</p>
+          </div>
+          <button class="modal-close" onclick="closeModal('student-form-modal')">✕</button>
+        </div>
+        <div class="modal-body">
+          <form id="reval-form" onsubmit="submitRevalForm(event)">
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Full Name *</label>
+                <input type="text" id="f-name" placeholder="e.g. Anuj Anil Kapse" required />
+              </div>
+              <div class="form-group">
+                <label>Registration Number *</label>
+                <input type="text" id="f-regno" placeholder="e.g. MBA/0171/62" oninput="onRegNoChange()" required />
+              </div>
+            </div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Subject / Course *</label>
+                <select id="f-subject" required onchange="onSubjectChange()">
+                  <option value="">Select subject</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Professor Name *</label>
+                <select id="f-prof" required onchange="onProfChange()">
+                  <option value="">Select subject first</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Section *</label>
+                <select id="f-section" required>
+                  <option value="">Select professor first</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label>Exam Type *</label>
+                <select id="f-examtype" required>
+                  <option value="">Select subject first</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Academic Year / Term *</label>
+              <input type="text" id="f-term" placeholder="e.g. Term 3, 2024-25" required />
+            </div>
+            <div class="form-group">
+              <label>Questions to be Re-Evaluated *</label>
+              <input type="text" id="f-questions" placeholder="e.g. Q2(b), Q4, Q7(a)" required oninput="updateDesperationIndex()" />
+              <!-- Desperation Index -->
+              <div class="desperation-wrap" id="desperation-wrap" style="display:none">
+                <div class="desperation-label">🎯 Desperation Index: <span id="desperation-text">Hopeful</span></div>
+                <div class="desperation-bar"><div class="desperation-fill" id="desperation-fill"></div></div>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Reason for Re-Evaluation *</label>
+              <textarea id="f-reason" rows="4"
+                placeholder="Explain clearly why you believe re-evaluation is warranted for each question listed above..."
+                required></textarea>
+            </div>
+            <div class="form-group">
+              <label>Supporting Documents <span style="font-weight:400;text-transform:none;letter-spacing:0">(Optional)</span></label>
+              <div class="file-upload-area" id="docs-upload-area"
+                onclick="document.getElementById('f-docs').click()">
+                <input type="file" id="f-docs" accept="image/*,.pdf,.doc,.docx" multiple style="display:none"
+                  onchange="handleDocsUpload(this)" />
+                <div class="file-upload-content" id="docs-upload-content">
+                  <span class="file-upload-icon">🗂️</span>
+                  <p>Click to upload supporting files</p>
+                  <span class="file-upload-hint">JPG, PNG, PDF or Word • Multiple files allowed • Max 5MB each</span>
+                </div>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Proof of Payment *</label>
+              <div class="file-upload-area" id="file-upload-area"
+                onclick="document.getElementById('f-payment').click()">
+                <input type="file" id="f-payment" accept="image/*,.pdf" style="display:none"
+                  onchange="handleFileUpload(this)" />
+                <div class="file-upload-content" id="file-upload-content">
+                  <span class="file-upload-icon">📎</span>
+                  <p>Click to upload payment receipt</p>
+                  <span class="file-upload-hint">JPG, PNG or PDF • Max 5MB</span>
+                </div>
+              </div>
+            </div>
+            <div class="deadline-notice">
+              <span>⚠️</span>
+              <span>Re-evaluation requests must be submitted within <strong>24 hours</strong> of result declaration.
+                Ensure payment of ₹500 per question before submission.</span>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn-secondary" onclick="closeModal('student-form-modal')">Cancel</button>
+              <button type="submit" class="btn-primary">Submit Request</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- Request Detail Modal -->
+    <div id="student-detail-modal" class="modal-overlay">
+      <div class="modal-box modal-wide">
+        <div class="modal-header">
+          <div>
+            <h3>Request Details</h3>
+          </div>
+          <button class="modal-close" onclick="closeModal('student-detail-modal')">✕</button>
+        </div>
+        <div class="modal-body" id="student-detail-body"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========== PROFESSOR DASHBOARD ========== -->
+  <div id="page-professor" class="page">
+    <nav class="navbar">
+      <div class="nav-brand">
+        <div class="nav-logo">IIM<span>C</span></div>
+        <span class="nav-title">Faculty Portal</span>
+      </div>
+      <div class="nav-right">
+        <div class="nav-user" id="prof-nav-user"></div>
+        <button class="btn-signout" onclick="signOut()">Sign Out</button>
+      </div>
+    </nav>
+
+    <div class="dashboard-container">
+      <div class="dashboard-header">
+        <div>
+          <h2 class="dashboard-title">Faculty Dashboard</h2>
+          <p class="dashboard-subtitle" id="prof-welcome"></p>
+        </div>
+        <div class="prof-badge">Professor View</div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-row" id="prof-stats"></div>
+
+      <!-- Tabs -->
+      <div class="tab-bar">
+        <button class="tab active" onclick="switchProfTab('pending', this)">Pending Review</button>
+        <button class="tab" onclick="switchProfTab('review', this)">Under Review</button>
+        <button class="tab" onclick="switchProfTab('resolved', this)">Resolved</button>
+        <button class="tab" onclick="switchProfTab('all', this)">All</button>
+      </div>
+
+      <div class="requests-grid" id="prof-requests-grid">
+        <div class="empty-state">
+          <div class="empty-icon">📭</div>
+          <p>No re-evaluation requests directed to you yet.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Prof Review Modal -->
+    <div id="prof-review-modal" class="modal-overlay">
+      <div class="modal-box modal-wide">
+        <div class="modal-header">
+          <div>
+            <h3>Review Re-Evaluation Request</h3>
+            <p class="modal-sub" id="prof-modal-sub"></p>
+          </div>
+          <button class="modal-close" onclick="closeModal('prof-review-modal')">✕</button>
+        </div>
+        <div class="modal-body">
+          <div id="prof-request-detail"></div>
+          <hr class="divider" />
+          <div class="review-section">
+            <h4>Professor's Decision</h4>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Updated Marks (per question)</label>
+                <input type="text" id="p-marks" placeholder="e.g. Q2: 8/10, Q4: 12/15" />
+              </div>
+              <div class="form-group">
+                <label>Final Status</label>
+                <select id="p-status">
+                  <option value="Under Review">Under Review</option>
+                  <option value="Resolved - Marks Increased">Marks Increased</option>
+                  <option value="Resolved - Marks Decreased">Marks Decreased</option>
+                  <option value="Resolved - No Change">No Change</option>
+                </select>
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Explanation / Remarks *</label>
+              <textarea id="p-remarks" rows="4"
+                placeholder="Explain the reasoning for the mark change (or no change). This will be visible to the student."></textarea>
+            </div>
+            <div class="form-actions">
+              <button type="button" class="btn-secondary" onclick="closeModal('prof-review-modal')">Cancel</button>
+              <button type="button" class="btn-primary" onclick="submitProfReview()">Save Decision</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <script src="js/app.js"></script>
+</body>
+
+</html>
