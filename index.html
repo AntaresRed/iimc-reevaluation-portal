@@ -28,6 +28,7 @@
   <link rel="icon" type="image/png" href="assets/browser_logo.png" />
   <link rel="stylesheet" href="css/style.css" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://checkout.razorpay.com/v1/checkout.js" async></script>
 </head>
 
 <body>
@@ -216,8 +217,24 @@
                 </div>
               </div>
             </div>
+            <!-- Razorpay online payment (explains itself when the server or keys are missing) -->
+            <div class="form-group" id="rzp-group">
+              <label>Pay Online</label>
+              <div class="rzp-box" id="rzp-box">
+                <div class="rzp-summary">
+                  <div>
+                    <div class="rzp-amount" id="rzp-amount">₹10</div>
+                    <div class="rzp-breakdown" id="rzp-breakdown">Flat re-evaluation fee per request</div>
+                  </div>
+                  <button type="button" class="btn-primary" id="rzp-pay-btn" onclick="startRazorpayPayment()" disabled>
+                    💳 Pay with Razorpay
+                  </button>
+                </div>
+                <div class="rzp-status" id="rzp-status"></div>
+              </div>
+            </div>
             <div class="form-group">
-              <label>Proof of Payment *</label>
+              <label id="payment-proof-label">Proof of Payment *</label>
               <div class="file-upload-area" id="file-upload-area"
                 onclick="document.getElementById('f-payment').click()">
                 <input type="file" id="f-payment" accept="image/*,.pdf" style="display:none"
@@ -232,7 +249,7 @@
             <div class="deadline-notice">
               <span>⚠️</span>
               <span>Re-evaluation requests must be submitted within <strong>24 hours</strong> of result declaration.
-                Ensure payment of ₹500 per question before submission.</span>
+                Ensure payment of the ₹10 re-evaluation fee before submission.</span>
             </div>
             <div class="form-actions">
               <button type="button" class="btn-secondary" onclick="closeModal('student-form-modal')">Cancel</button>

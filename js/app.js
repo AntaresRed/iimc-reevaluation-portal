@@ -165,6 +165,174 @@ async function uploadToCloudinary(file) {
   return data.secure_url;  // permanent HTTPS URL
 }
 
+// ===== RAZORPAY PAYMENT (POC) =====
+// Orders are created and signatures verified by server.js — the key secret never reaches the browser.
+// The fee is a flat amount per request, set on the server (PAYMENT_AMOUNT_INR, default ₹10).
+// If the server is unreachable or has no keys, the box explains why and the receipt upload is required.
+let _rzpConfig = null;    // { enabled, keyId, amount, currency } from /api/payment/config
+let _rzpPayment = null;   // verified payment for the currently open form
+
+function isRazorpayEnabled() {
+  return Boolean(_serverMode && _rzpConfig && _rzpConfig.enabled);
+}
+
+async function loadPaymentConfig() {
+  if (!_serverMode) return;
+  try {
+    const res = await fetch('/api/payment/config', { signal: AbortSignal.timeout(1500) });
+    if (res.ok) _rzpConfig = await res.json();
+  } catch { _rzpConfig = null; }
+}
+
+// Why online payment can't be used right now (null when it can)
+function razorpayUnavailableReason() {
+  if (!_serverMode) return 'Online payment needs the portal server. Start it with start.bat and open http://localhost:3000.';
+  if (!_rzpConfig) return 'Could not load payment settings from the server.';
+  if (!_rzpConfig.enabled) return 'Razorpay keys are not set. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env and restart the server.';
+  return null;
+}
+
+function resetRazorpayBox() {
+  _rzpPayment = null;
+  const enabled = isRazorpayEnabled();
+  document.getElementById('payment-proof-label').innerHTML = enabled
+    ? 'Proof of Payment <span style="font-weight:400;text-transform:none;letter-spacing:0">(Optional when paid online)</span>'
+    : 'Proof of Payment *';
+  updateRazorpayBox();
+}
+
+function updateRazorpayBox() {
+  const btn = document.getElementById('rzp-pay-btn');
+  const box = document.getElementById('rzp-box');
+  const amount = _rzpConfig && _rzpConfig.amount ? _rzpConfig.amount : 10;
+  document.getElementById('rzp-amount').textContent = '₹' + amount.toLocaleString('en-IN');
+  document.getElementById('rzp-breakdown').textContent = 'Flat re-evaluation fee per request';
+  box.classList.toggle('rzp-paid', Boolean(_rzpPayment));
+
+  const reason = razorpayUnavailableReason();
+  if (reason) {
+    btn.disabled = true;
+    btn.textContent = '💳 Pay with Razorpay';
+    setRazorpayStatus(reason + ' Until then, upload a payment receipt below.', 'err');
+  } else if (_rzpPayment) {
+    btn.disabled = true;
+    btn.textContent = '✓ Paid';
+    setRazorpayStatus(`Payment verified · ${_rzpPayment.paymentId}`, 'ok');
+  } else {
+    btn.disabled = false;
+    btn.textContent = '💳 Pay with Razorpay';
+  }
+}
+
+function setRazorpayStatus(msg, kind) {
+  const el = document.getElementById('rzp-status');
+  el.textContent = msg;
+  el.className = 'rzp-status' + (kind ? ' ' + kind : '');
+}
+
+async function startRazorpayPayment() {
+  if (!isRazorpayEnabled() || _rzpPayment) return;
+  if (typeof Razorpay === 'undefined') {
+    showToast('Razorpay checkout failed to load. Check your connection.', 'error');
+    return;
+  }
+
+  const btn = document.getElementById('rzp-pay-btn');
+  btn.disabled = true;
+  btn.textContent = 'Creating order...';
+  setRazorpayStatus('', '');
+
+  let order;
+  try {
+    const res = await fetch('/api/payment/order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        studentEmail: currentUser.email,
+        subject: document.getElementById('f-subject').value,
+        questions: document.getElementById('f-questions').value.trim(),
+      }),
+    });
+    order = await res.json();
+    if (!res.ok) throw new Error(order.error || 'Could not create order');
+  } catch (err) {
+    updateRazorpayBox();
+    setRazorpayStatus('Could not start payment: ' + err.message, 'err');
+    return;
+  }
+
+  const rzp = new Razorpay({
+    key: _rzpConfig.keyId,
+    order_id: order.orderId,
+    amount: order.amount,
+    currency: order.currency,
+    name: 'IIM Calcutta',
+    description: 'Re-evaluation fee',
+    prefill: {
+      name: document.getElementById('f-name').value.trim() || currentUser.name,
+      email: currentUser.email,
+    },
+    notes: { regNo: document.getElementById('f-regno').value.trim() },
+    theme: { color: '#5D2E0C' },
+    handler: response => verifyRazorpayPayment(response),
+    modal: {
+      ondismiss: () => {
+        updateRazorpayBox();
+        if (!_rzpPayment) setRazorpayStatus('Payment cancelled.', 'err');
+      },
+    },
+  });
+  rzp.on('payment.failed', resp => {
+    setRazorpayStatus('Payment failed: ' + (resp.error && resp.error.description || 'unknown error'), 'err');
+  });
+  btn.textContent = 'Waiting for payment...';
+  rzp.open();
+}
+
+async function verifyRazorpayPayment(response) {
+  setRazorpayStatus('Verifying payment...', '');
+  try {
+    const res = await fetch('/api/payment/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(response),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.verified) throw new Error(data.error || 'Verification failed');
+    _rzpPayment = data;
+    updateRazorpayBox();
+    showToast('Payment successful! You can now submit your request.', 'success');
+  } catch (err) {
+    updateRazorpayBox();
+    setRazorpayStatus('Payment could not be verified: ' + err.message +
+      ` (Payment ID ${response.razorpay_payment_id} — keep this for reference)`, 'err');
+  }
+}
+
+// Returns { ok, fields } for the request record, or { ok: false } after showing an error toast
+function getPaymentForSubmission() {
+  const paymentFile = document.getElementById('f-payment').files[0];
+  if (_rzpPayment) {
+    return {
+      ok: true,
+      fields: {
+        paymentMethod: 'razorpay',
+        paymentFileName: paymentFile ? paymentFile.name : null,
+        razorpayOrderId: _rzpPayment.orderId,
+        razorpayPaymentId: _rzpPayment.paymentId,
+        amountPaid: _rzpPayment.amount / 100,
+      },
+    };
+  }
+  if (!paymentFile) {
+    showToast(isRazorpayEnabled()
+      ? 'Please pay with Razorpay or upload proof of payment.'
+      : 'Please upload proof of payment.', 'error');
+    return { ok: false };
+  }
+  return { ok: true, fields: { paymentMethod: 'receipt', paymentFileName: paymentFile.name } };
+}
+
 // ===== HISTORY TIMELINE RENDERER =====
 function renderHistoryTimeline(r) {
   // Build history from the stored array; fall back to synthesised entries for legacy requests
@@ -590,10 +758,13 @@ function openStudentDetail(id) {
         <div class="detail-item detail-full"><label>Reason for Re-Evaluation</label><span style="white-space:pre-wrap">${r.reason}</span></div>
         <div class="detail-item"><label>Submitted On</label><span>${formatDate(r.createdAt)}</span></div>
         <div class="detail-item"><label>Request ID</label><span style="font-family:monospace;font-size:12px">${r.id}</span></div>
-        <div class="detail-item"><label>Payment Proof</label><span>${r.paymentUrl
+        ${r.razorpayPaymentId ? `
+        <div class="detail-item"><label>Paid Online</label><span style="color:#3fb950">✓ ₹${r.amountPaid} via Razorpay</span></div>
+        <div class="detail-item"><label>Payment ID</label><span style="font-family:monospace;font-size:12px">${r.razorpayPaymentId}</span></div>` : ''}
+        ${r.razorpayPaymentId && !r.paymentFileName ? '' : `<div class="detail-item"><label>Payment Proof</label><span>${r.paymentUrl
       ? `<a href="${r.paymentUrl}" target="_blank" style="color:var(--iim-brown);text-decoration:underline">View receipt ↗</a>`
       : '<span style="color:#3fb950">✓ Uploaded (local)</span>'
-    }</span></div>
+    }</span></div>`}
         ${r.supportingDocs && r.supportingDocs.length ? `
         <div class="detail-item detail-full"><label>Supporting Docs</label><span style="display:flex;flex-wrap:wrap;gap:8px">${r.supportingDocUrls && r.supportingDocUrls.length
         ? r.supportingDocUrls.map((url, i) => `<a href="${url}" target="_blank" style="color:var(--iim-brown);text-decoration:underline">${r.supportingDocs[i] || 'File ' + (i + 1)} ↗</a>`).join('')
@@ -627,6 +798,7 @@ function showStudentForm() {
     <p>Upload answer scripts, screenshots or any supporting evidence</p>
     <span class="file-upload-hint">JPG, PNG, PDF or Word • Multiple files • Max 5MB each</span>`;
   document.getElementById('docs-upload-area').classList.remove('has-file');
+  resetRazorpayBox();
   openModal('student-form-modal');
 }
 
@@ -658,8 +830,9 @@ function handleDocsUpload(input) {
 
 async function submitRevalForm(e) {
   e.preventDefault();
+  const payment = getPaymentForSubmission();
+  if (!payment.ok) return;
   const paymentFile = document.getElementById('f-payment').files[0];
-  if (!paymentFile) { showToast('Please upload proof of payment.', 'error'); return; }
   const section = document.getElementById('f-section').value;
   if (!section) { showToast('Please select your section.', 'error'); return; }
 
@@ -668,13 +841,13 @@ async function submitRevalForm(e) {
   const originalLabel = submitBtn.textContent;
   submitBtn.disabled = true;
 
-  let paymentUrl = null, paymentFileName = paymentFile.name;
+  let paymentUrl = null;
   let supportingDocUrls = [], supportingDocNames = [];
 
   try {
     if (CLOUDINARY_ENABLED) {
       submitBtn.textContent = 'Uploading payment receipt...';
-      paymentUrl = await uploadToCloudinary(paymentFile);
+      if (paymentFile) paymentUrl = await uploadToCloudinary(paymentFile);
 
       const docFiles = Array.from(document.getElementById('f-docs').files || []);
       for (let i = 0; i < docFiles.length; i++) {
@@ -707,7 +880,7 @@ async function submitRevalForm(e) {
     term: document.getElementById('f-term').value.trim(),
     questions: document.getElementById('f-questions').value.trim(),
     reason: document.getElementById('f-reason').value.trim(),
-    paymentFileName,
+    ...payment.fields,
     paymentUrl,                      // null if Cloudinary not configured
     supportingDocs: supportingDocNames,
     supportingDocUrls,               // [] if Cloudinary not configured
@@ -995,6 +1168,7 @@ function showToast(msg, type = 'info') {
 window.addEventListener('DOMContentLoaded', async () => {
   // Load data from server (or localStorage fallback) before rendering anything
   await loadInitialData();
+  await loadPaymentConfig();
 
   const session = localStorage.getItem('reval_session');
   if (session) {
@@ -1267,8 +1441,8 @@ closeModal = function (id) {
 const _baseSubmitRevalForm = submitRevalForm;
 submitRevalForm = function (e) {
   e.preventDefault();
-  const paymentFile = document.getElementById('f-payment').files[0];
-  if (!paymentFile) { showToast('Please upload proof of payment.', 'error'); return; }
+  const payment = getPaymentForSubmission();
+  if (!payment.ok) return;
   const section = document.getElementById('f-section').value;
   if (!section) { showToast('Please select your section.', 'error'); return; }
   const request = {
@@ -1283,7 +1457,7 @@ submitRevalForm = function (e) {
     term: document.getElementById('f-term').value.trim(),
     questions: document.getElementById('f-questions').value.trim(),
     reason: document.getElementById('f-reason').value.trim(),
-    paymentFileName: paymentFile.name,
+    ...payment.fields,
     status: 'Pending',
     createdAt: Date.now(),
     updatedMarks: null,

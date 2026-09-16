@@ -821,6 +821,36 @@ body {
   gap: 16px;
 }
 
+/* ===== RAZORPAY PAYMENT BOX ===== */
+.rzp-box {
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-md);
+  background: var(--iim-cream);
+  padding: 16px 18px;
+}
+.rzp-box.rzp-paid {
+  border-color: var(--success);
+  background: var(--success-bg);
+}
+.rzp-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.rzp-amount {
+  font-size: 22px;
+  font-weight: 800;
+  color: var(--iim-brown);
+}
+.rzp-breakdown { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.rzp-status { font-size: 13px; margin-top: 10px; }
+.rzp-status:empty { display: none; }
+.rzp-status.ok { color: var(--success); font-weight: 600; }
+.rzp-status.err { color: var(--danger); }
+#rzp-pay-btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+
 .deadline-notice {
   display: flex;
   align-items: flex-start;
