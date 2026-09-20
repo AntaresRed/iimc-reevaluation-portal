@@ -15,10 +15,6 @@ const fs = require('fs');
 const path = require('path');
 
 const ROOT = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
-const DATA_FILE = path.join(DATA_DIR, 'requests.json');
-const ARCHIVE_FILE = path.join(DATA_DIR, 'archive.json');
-const PAYMENTS_FILE = path.join(DATA_DIR, 'payments.json');
 
 // Load KEY=VALUE pairs from .env (if present) without overriding real env vars
 const ENV_FILE = path.join(ROOT, '.env');
@@ -30,14 +26,26 @@ if (fs.existsSync(ENV_FILE)) {
 }
 
 const PORT = process.env.PORT || 3000;
+const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'requests.json');
+const ARCHIVE_FILE = path.join(DATA_DIR, 'archive.json');
+const PAYMENTS_FILE = path.join(DATA_DIR, 'payments.json');
 
 // ===== RAZORPAY CONFIG (POC) =====
 // Put RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env (use rzp_test_ keys while testing).
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
 const RAZORPAY_ENABLED = Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
+// Optional: Dashboard → Webhooks, events refund.processed + refund.failed → <public URL>/api/razorpay/webhook
+const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
 // Flat fee per re-evaluation request, in rupees (override with PAYMENT_AMOUNT_INR in .env)
 const PAYMENT_AMOUNT_INR = Number(process.env.PAYMENT_AMOUNT_INR) || 10;
+
+// ===== UPI CONFIG =====
+// The college UPI ID students pay by QR. Plain UPI has no test mode and cannot tell this app
+// that money arrived: the office matches UTRs against the bank statement and refunds by hand.
+const UPI_VPA = process.env.UPI_VPA || '';
+const UPI_PAYEE_NAME = process.env.UPI_PAYEE_NAME || 'IIM Calcutta';
 
 // Ensure data directory and files exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -157,11 +165,211 @@ function isValidPaymentSignature(orderId, paymentId, signature) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+function readPayments() {
+  try { return JSON.parse(fs.readFileSync(PAYMENTS_FILE, 'utf8')); }
+  catch { return { payments: [] }; }
+}
+
 function recordVerifiedPayment(entry) {
-  let store = { payments: [] };
-  try { store = JSON.parse(fs.readFileSync(PAYMENTS_FILE, 'utf8')); } catch { }
+  const store = readPayments();
+  if (store.payments.some(p => p.paymentId === entry.paymentId)) return;
   store.payments.push(entry);
   fs.writeFileSync(PAYMENTS_FILE, JSON.stringify(store, null, 2), 'utf8');
+}
+
+function readRawBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// ===== FEE REFUND POLICY =====
+// Digital version of the demand-draft process: the fee is collected at submission,
+// refunded if the marks change (up or down), and retained if they don't.
+const REFUND_STATUSES = ['Resolved - Marks Increased', 'Resolved - Marks Decreased'];
+// Server-owned fields: the browser's bulk save can never overwrite these
+const REVIEW_FIELDS = ['status', 'updatedMarks', 'professorRemarks', 'reviewedAt', 'history', 'refund', 'paymentVerified'];
+
+function isRefundActive(refund) {
+  return Boolean(refund && (refund.status === 'pending' || refund.status === 'processed'));
+}
+
+// Maps Razorpay's refund status onto ours: pending | processed | failed
+function refundFromRazorpay(entity, previous = {}) {
+  return {
+    ...previous,
+    id: entity.id,
+    amount: entity.amount,
+    status: entity.status === 'processed' ? 'processed' : entity.status === 'failed' ? 'failed' : 'pending',
+    processedAt: entity.status === 'processed' ? (previous.processedAt || Date.now()) : previous.processedAt || null,
+    error: null,
+  };
+}
+
+const refundsInFlight = new Set();  // request IDs with a refund call in progress
+
+// Issues the Razorpay refund for a request (idempotent). Mutates and returns request.refund.
+async function issueRefund(request, actor) {
+  if (isRefundActive(request.refund)) return request.refund;
+  if (request.paymentMethod !== 'razorpay' || !request.razorpayPaymentId) {
+    request.refund = {
+      status: 'manual',
+      note: request.paymentMethod === 'upi'
+        ? `Paid by UPI (UTR ${request.upiUtr || '—'}) — the MBA office sends the refund back to ${request.upiPayerVpa || 'the student'}.`
+        : 'Paid by receipt — the MBA office refunds this manually.',
+    };
+    return request.refund;
+  }
+  // Only refund payments this server verified, for the amount actually paid
+  const payment = readPayments().payments.find(p => p.paymentId === request.razorpayPaymentId);
+  if (!payment) {
+    request.refund = { status: 'failed', error: 'Payment was not verified by this server.', attemptedAt: Date.now() };
+    return request.refund;
+  }
+  if (!RAZORPAY_ENABLED) {
+    request.refund = { status: 'failed', error: 'Razorpay is not configured on the server.', attemptedAt: Date.now() };
+    return request.refund;
+  }
+  if (refundsInFlight.has(request.id)) throw new Error('A refund for this request is already in progress.');
+
+  refundsInFlight.add(request.id);
+  try {
+    // Guard against double refunds if an earlier attempt succeeded but wasn't saved
+    const existing = await razorpayApi('GET', `/v1/payments/${encodeURIComponent(payment.paymentId)}/refunds`);
+    const prior = (existing.items || []).find(r => r.status !== 'failed');
+    const entity = prior || await razorpayApi('POST', `/v1/payments/${encodeURIComponent(payment.paymentId)}/refund`, {
+      amount: payment.amount,
+      speed: 'normal',
+      receipt: request.id.slice(0, 40),
+      notes: { requestId: request.id, reason: request.status, initiatedBy: String(actor || '').slice(0, 256) },
+    });
+    request.refund = refundFromRazorpay(entity, { initiatedAt: Date.now(), initiatedBy: actor });
+  } catch (e) {
+    request.refund = { status: 'failed', error: e.message, attemptedAt: Date.now(), initiatedBy: actor };
+  } finally {
+    refundsInFlight.delete(request.id);
+  }
+
+  request.history = Array.isArray(request.history) ? request.history : [];
+  request.history.push(request.refund.status === 'failed'
+    ? { at: Date.now(), event: 'Refund failed', by: 'Razorpay', note: request.refund.error }
+    : { at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund initiated', by: 'Razorpay',
+        note: `₹${request.refund.amount / 100} · ${request.refund.id}` });
+  return request.refund;
+}
+
+function findRequest(data, id) {
+  return (data.requests || []).find(r => r.id === id);
+}
+
+function saveAndArchive(data) {
+  writeData(data);
+  archiveRequests(data.requests);
+}
+
+// Routes: POST /api/requests/:id/review | /refund | /refund/refresh
+async function handleRequestActions(req, res) {
+  const m = req.url.match(/^\/api\/requests\/([^/]+)\/(review|refund|refund\/refresh)$/);
+  if (!m || req.method !== 'POST') return false;
+  const id = decodeURIComponent(m[1]);
+  const action = m[2];
+
+  try {
+    const body = await readJsonBody(req);
+    const data = readData();
+    const request = findRequest(data, id);
+    if (!request) { sendJson(res, 404, { error: 'Request not found.' }); return true; }
+
+    if (action === 'review') {
+      const status = String(body.status || '');
+      const allowed = ['Under Review', 'Resolved - No Change', ...REFUND_STATUSES];
+      if (!allowed.includes(status)) { sendJson(res, 400, { error: 'Invalid status.' }); return true; }
+      if (!String(body.professorRemarks || '').trim()) { sendJson(res, 400, { error: 'Remarks are required.' }); return true; }
+      // A refund can't be taken back, so the decision must stay "marks changed"
+      if (isRefundActive(request.refund) && !REFUND_STATUSES.includes(status)) {
+        sendJson(res, 409, { error: 'The fee has already been refunded, so the result must stay "Marks Increased" or "Marks Decreased".' });
+        return true;
+      }
+
+      const oldStatus = request.status;
+      request.updatedMarks = String(body.updatedMarks || '').trim() || null;
+      request.professorRemarks = String(body.professorRemarks).trim();
+      request.status = status;
+      request.reviewedAt = Date.now();
+      request.history = Array.isArray(request.history) ? request.history : [];
+      request.history.push({
+        at: Date.now(),
+        event: oldStatus === status ? 'Remarks updated' : 'Status changed',
+        by: body.by || '—',
+        from: oldStatus,
+        to: status,
+        note: request.professorRemarks,
+      });
+      // Save the decision first so it isn't lost if the refund call is slow or fails
+      saveAndArchive(data);
+      if (REFUND_STATUSES.includes(status)) await issueRefund(request, body.by);
+    }
+
+    if (action === 'refund') {
+      if (!REFUND_STATUSES.includes(request.status)) { sendJson(res, 409, { error: 'Marks did not change, so no refund is due.' }); return true; }
+      await issueRefund(request, body.by);
+    }
+
+    if (action === 'refund/refresh') {
+      if (request.refund && request.refund.id && request.refund.status === 'pending' && RAZORPAY_ENABLED) {
+        const entity = await razorpayApi('GET', `/v1/refunds/${encodeURIComponent(request.refund.id)}`);
+        const before = request.refund.status;
+        request.refund = refundFromRazorpay(entity, request.refund);
+        if (before !== request.refund.status) {
+          request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay', note: request.refund.id });
+        }
+      }
+    }
+
+    // Re-read so concurrent saves made during the Razorpay call aren't clobbered
+    const latest = readData();
+    const idx = latest.requests.findIndex(r => r.id === id);
+    if (idx !== -1) {
+      for (const f of REVIEW_FIELDS) latest.requests[idx][f] = request[f];
+      saveAndArchive(latest);
+    }
+    sendJson(res, 200, { request: idx !== -1 ? latest.requests[idx] : request });
+  } catch (e) {
+    sendJson(res, 400, { error: e.message });
+  }
+  return true;
+}
+
+// POST /api/razorpay/webhook — refund.processed / refund.failed (needs RAZORPAY_WEBHOOK_SECRET and a public URL)
+async function handleWebhook(req, res) {
+  if (!RAZORPAY_WEBHOOK_SECRET) { sendJson(res, 503, { error: 'Webhook secret is not configured.' }); return; }
+  const raw = await readRawBody(req);
+  const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex');
+  const given = Buffer.from(String(req.headers['x-razorpay-signature'] || ''));
+  if (given.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(expected), given)) {
+    sendJson(res, 400, { error: 'Invalid webhook signature.' });
+    return;
+  }
+
+  let event;
+  try { event = JSON.parse(raw.toString('utf8')); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
+  const entity = event.payload && event.payload.refund && event.payload.refund.entity;
+  if (entity && /^refund\./.test(event.event)) {
+    const data = readData();
+    const request = data.requests.find(r => r.refund && r.refund.id === entity.id);
+    if (request) {
+      const before = request.refund.status;
+      request.refund = refundFromRazorpay(entity, request.refund);
+      if (before !== request.refund.status && request.refund.status !== 'pending') {
+        request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay webhook', note: entity.id });
+      }
+      saveAndArchive(data);
+    }
+  }
+  sendJson(res, 200, { ok: true });
 }
 
 // Pending orders created by this server process: order_id → { amount, currency }
@@ -174,7 +382,15 @@ async function handlePaymentApi(req, res) {
       keyId: RAZORPAY_ENABLED ? RAZORPAY_KEY_ID : null,
       amount: PAYMENT_AMOUNT_INR,
       currency: 'INR',
+      upi: UPI_VPA ? { vpa: UPI_VPA, payeeName: UPI_PAYEE_NAME } : null,
     });
+    return true;
+  }
+
+  if (req.url.startsWith('/api/payment/upi/check') && req.method === 'GET') {
+    const utr = new URL(req.url, 'http://localhost').searchParams.get('utr') || '';
+    const used = (readData().requests || []).some(r => r.upiUtr && r.upiUtr === utr);
+    sendJson(res, 200, { used });
     return true;
   }
 
@@ -217,6 +433,21 @@ async function handlePaymentApi(req, res) {
         order = { amount: o.amount, currency: o.currency };
       }
       pendingOrders.delete(razorpay_order_id);
+
+      let payment = await razorpayApi('GET', '/v1/payments/' + encodeURIComponent(razorpay_payment_id));
+      if (payment.order_id !== razorpay_order_id || payment.amount !== order.amount) {
+        sendJson(res, 400, { verified: false, error: 'Payment does not match the order.' });
+        return true;
+      }
+      if (payment.status === 'authorized') {
+        payment = await razorpayApi('POST', '/v1/payments/' + encodeURIComponent(razorpay_payment_id) + '/capture',
+          { amount: payment.amount, currency: payment.currency });
+      }
+      if (payment.status !== 'captured') {
+        sendJson(res, 400, { verified: false, error: 'Payment is ' + payment.status + ', not captured.' });
+        return true;
+      }
+
       const entry = {
         orderId: razorpay_order_id,
         paymentId: razorpay_payment_id,
@@ -286,11 +517,34 @@ const server = http.createServer((req, res) => {
     req.on('end', () => {
       try {
         const payload = JSON.parse(body);
-        writeData(payload);
-        // Append any new/changed requests to the immutable archive
-        if (Array.isArray(payload.requests)) {
-          archiveRequests(payload.requests);
+        if (!Array.isArray(payload.requests)) throw new Error('requests must be an array');
+        // Merge by ID so a browser with a stale copy can't drop other people's requests,
+        // and keep server-owned review/refund fields for requests the server already has.
+        const current = readData();
+        const byId = new Map((current.requests || []).map(r => [r.id, r]));
+        for (const incoming of payload.requests) {
+          const existing = byId.get(incoming.id);
+          if (!existing) {
+            const { refund, paymentVerified, ...fresh } = incoming;
+            // One UPI reference number can back only one request
+            if (fresh.upiUtr && [...byId.values()].some(r => r.upiUtr === fresh.upiUtr)) {
+              throw new Error('UPI reference ' + fresh.upiUtr + ' is already used by another request.');
+            }
+            if (fresh.paymentMethod === 'upi') fresh.paymentVerified = false;
+            byId.set(incoming.id, fresh);
+          } else {
+            const merged = { ...existing, ...incoming };
+            // Review fields change only through /api/requests/:id/review (except when the server has none yet)
+            const serverReviewed = existing.reviewedAt || existing.refund;
+            for (const f of REVIEW_FIELDS) {
+              if (serverReviewed || f === 'refund') merged[f] = existing[f];
+            }
+            byId.set(incoming.id, merged);
+          }
         }
+        const merged = { requests: [...byId.values()] };
+        writeData(merged);
+        archiveRequests(merged.requests);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
@@ -306,6 +560,20 @@ const server = http.createServer((req, res) => {
     const archive = readArchive();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(archive));
+    return;
+  }
+
+  // ── Review decisions and fee refunds ──
+  if (req.url.startsWith('/api/requests/')) {
+    handleRequestActions(req, res).then(handled => {
+      if (!handled) sendJson(res, 404, { error: 'Not Found' });
+    });
+    return;
+  }
+
+  // ── Razorpay webhook ──
+  if (req.url === '/api/razorpay/webhook' && req.method === 'POST') {
+    handleWebhook(req, res).catch(e => sendJson(res, 500, { error: e.message }));
     return;
   }
 
@@ -341,6 +609,8 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  💾  Live data:       ${DATA_FILE}`);
   console.log(`  🗄️   Archive:         ${ARCHIVE_FILE}`);
   console.log(`  💳  Razorpay:        ${RAZORPAY_ENABLED ? 'enabled (' + RAZORPAY_KEY_ID + ')' : 'disabled — set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env'}`);
+  console.log(`  📱  UPI QR:          ${UPI_VPA ? UPI_VPA + ' — REAL money, no test mode' : 'off (set UPI_VPA in .env)'}`);
+  console.log(`  🔔  Webhook:         ${RAZORPAY_WEBHOOK_SECRET ? 'enabled at /api/razorpay/webhook' : 'off (refund status is refreshed on demand)'}`);
   console.log('  ⏹   Press Ctrl+C to stop the server');
   console.log('');
 });

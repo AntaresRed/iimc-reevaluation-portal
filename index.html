@@ -29,6 +29,7 @@
   <link rel="stylesheet" href="css/style.css" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="https://checkout.razorpay.com/v1/checkout.js" async></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 
 <body>
@@ -217,32 +218,61 @@
                 </div>
               </div>
             </div>
-            <!-- Razorpay online payment (explains itself when the server or keys are missing) -->
-            <div class="form-group" id="rzp-group">
-              <label>Pay Online</label>
-              <div class="rzp-box" id="rzp-box">
-                <div class="rzp-summary">
-                  <div>
-                    <div class="rzp-amount" id="rzp-amount">₹10</div>
-                    <div class="rzp-breakdown" id="rzp-breakdown">Flat re-evaluation fee per request</div>
-                  </div>
-                  <button type="button" class="btn-primary" id="rzp-pay-btn" onclick="startRazorpayPayment()" disabled>
-                    💳 Pay with Razorpay
-                  </button>
-                </div>
-                <div class="rzp-status" id="rzp-status"></div>
-              </div>
-            </div>
+            <!-- ===== PAYMENT ===== -->
             <div class="form-group">
-              <label id="payment-proof-label">Proof of Payment *</label>
-              <div class="file-upload-area" id="file-upload-area"
-                onclick="document.getElementById('f-payment').click()">
-                <input type="file" id="f-payment" accept="image/*,.pdf" style="display:none"
-                  onchange="handleFileUpload(this)" />
-                <div class="file-upload-content" id="file-upload-content">
-                  <span class="file-upload-icon">📎</span>
-                  <p>Click to upload payment receipt</p>
-                  <span class="file-upload-hint">JPG, PNG or PDF • Max 5MB</span>
+              <label>Payment *</label>
+              <div class="pay-method-tabs" id="pay-method-tabs">
+                <button type="button" class="pay-method active" data-method="upi" onclick="selectPaymentMethod('upi')">
+                  <span class="pay-method-icon">📱</span> UPI (QR)
+                </button>
+                <button type="button" class="pay-method" data-method="razorpay" onclick="selectPaymentMethod('razorpay')">
+                  <span class="pay-method-icon">💳</span> Razorpay
+                  <span class="pay-method-note">Card · Netbanking · UPI</span>
+                </button>
+              </div>
+
+              <!-- UPI: student pays the college UPI ID, then enters the reference number -->
+              <div class="pay-panel" id="upi-panel">
+                <div class="upi-layout">
+                  <div class="upi-qr-col">
+                    <div class="upi-qr" id="upi-qr"></div>
+                    <a class="upi-open-link" id="upi-open-link" href="#" target="_blank" rel="noopener">Open UPI app</a>
+                  </div>
+                  <div class="upi-details">
+                    <div class="rzp-amount" id="upi-amount">₹10</div>
+                    <div class="rzp-breakdown">Scan with any UPI app, then enter the reference number below</div>
+                    <div class="upi-vpa-row">
+                      <code id="upi-vpa">—</code>
+                      <button type="button" class="btn-secondary btn-copy" onclick="copyUpiId()">Copy</button>
+                    </div>
+                    <div class="form-grid-2 upi-inputs">
+                      <div class="form-group">
+                        <label>UPI Reference / UTR *</label>
+                        <input type="text" id="f-upi-utr" placeholder="12-digit number from your UPI app" inputmode="numeric" maxlength="12" />
+                      </div>
+                      <div class="form-group">
+                        <label>Your UPI ID *</label>
+                        <input type="text" id="f-upi-vpa" placeholder="name@bank — refunds are sent here" />
+                      </div>
+                    </div>
+                    <div class="upi-status" id="upi-status"></div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Razorpay: order created and payment verified by the server -->
+              <div class="pay-panel" id="rzp-group" style="display:none">
+                <div class="rzp-box" id="rzp-box">
+                  <div class="rzp-summary">
+                    <div>
+                      <div class="rzp-amount" id="rzp-amount">₹10</div>
+                      <div class="rzp-breakdown" id="rzp-breakdown">Flat re-evaluation fee per request</div>
+                    </div>
+                    <button type="button" class="btn-primary" id="rzp-pay-btn" onclick="startRazorpayPayment()" disabled>
+                      💳 Pay with Razorpay
+                    </button>
+                  </div>
+                  <div class="rzp-status" id="rzp-status"></div>
                 </div>
               </div>
             </div>
@@ -337,7 +367,7 @@
               </div>
               <div class="form-group">
                 <label>Final Status</label>
-                <select id="p-status">
+                <select id="p-status" onchange="updateRefundHint()">
                   <option value="Under Review">Under Review</option>
                   <option value="Resolved - Marks Increased">Marks Increased</option>
                   <option value="Resolved - Marks Decreased">Marks Decreased</option>
@@ -345,6 +375,7 @@
                 </select>
               </div>
             </div>
+            <div class="refund-hint" id="p-refund-hint" style="display:none"></div>
             <div class="form-group">
               <label>Explanation / Remarks *</label>
               <textarea id="p-remarks" rows="4"
