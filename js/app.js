@@ -165,22 +165,14 @@ async function uploadToCloudinary(file) {
   return data.secure_url;  // permanent HTTPS URL
 }
 
-// ===== PAYMENT (POC) =====
-// Two ways to pay the flat fee (PAYMENT_AMOUNT_INR on the server, default ₹10):
-//   • UPI QR   — the student pays the college UPI ID directly and enters the UTR.
-//                UPI cannot notify this app, so the MBA office checks it against the bank
-//                statement and any refund is sent back by hand.
-//   • Razorpay — order created and signature verified by server.js; refunds are automatic.
-let _payConfig = null;    // { enabled, keyId, amount, currency, upi } from /api/payment/config
-let _rzpPayment = null;   // verified Razorpay payment for the currently open form
-let _payMethod = 'upi';   // method chosen in the form
+// ===== PAYMENT — UPI QR (POC) =====
+// The student scans the college UPI QR and pays the flat fee (PAYMENT_AMOUNT_INR, default ₹10).
+// UPI cannot tell this app that money arrived, so a request is recorded as "payment unconfirmed"
+// until the MBA office matches it against the bank statement. Refunds are sent back by hand.
+let _payConfig = null;    // { amount, currency, upi } from /api/payment/config
 
 function paymentAmount() {
   return _payConfig && _payConfig.amount ? _payConfig.amount : 10;
-}
-
-function isRazorpayEnabled() {
-  return Boolean(_serverMode && _payConfig && _payConfig.enabled);
 }
 
 function isUpiEnabled() {
@@ -195,42 +187,15 @@ async function loadPaymentConfig() {
   } catch { _payConfig = null; }
 }
 
-// Why Razorpay can't be used right now (null when it can)
-function razorpayUnavailableReason() {
-  if (!_serverMode) return 'Razorpay needs the portal server. Start it with start.bat and open the address it prints.';
-  if (!_payConfig) return 'Could not load payment settings from the server.';
-  if (!_payConfig.enabled) return 'Razorpay keys are not set. Add RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET to .env and restart the server.';
-  return null;
-}
-
-function selectPaymentMethod(method) {
-  _payMethod = method;
-  document.querySelectorAll('#pay-method-tabs .pay-method').forEach(b => {
-    b.classList.toggle('active', b.dataset.method === method);
-  });
-  document.getElementById('upi-panel').style.display = method === 'upi' ? '' : 'none';
-  document.getElementById('rzp-group').style.display = method === 'razorpay' ? '' : 'none';
-  if (method === 'upi') updateUpiBox(); else updateRazorpayBox();
-}
-
 function resetPaymentSection() {
-  _rzpPayment = null;
-  ['f-upi-utr', 'f-upi-vpa'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
   setUpiStatus('', '');
-  setRazorpayStatus('', '');
-  selectPaymentMethod(isUpiEnabled() ? 'upi' : 'razorpay');
+  updateUpiBox();
 }
 
-// ===== UPI QR =====
+// Plain UPI collect link: payee address + payee name, the format UPI apps expect
 function upiPayLink() {
   const upi = (_payConfig && _payConfig.upi) || {};
-  const params = new URLSearchParams({
-    pa: upi.vpa || '',
-    pn: upi.payeeName || 'IIM Calcutta',
-    am: paymentAmount().toFixed(2),
-    cu: 'INR',
-    tn: 'Reevaluation fee',
-  });
+  const params = new URLSearchParams({ pa: upi.vpa || '', pn: upi.payeeName || 'IIM Calcutta' });
   return 'upi://pay?' + params.toString();
 }
 
@@ -247,7 +212,9 @@ function updateUpiBox() {
     vpaEl.textContent = '—';
     qrEl.innerHTML = '<div class="upi-qr-missing">QR unavailable</div>';
     linkEl.style.display = 'none';
-    setUpiStatus('No college UPI ID is configured. Set UPI_VPA in .env and restart the server, or pay with Razorpay instead.', 'err');
+    setUpiStatus(_serverMode
+      ? 'No college UPI ID is configured. Set UPI_VPA in .env and restart the server.'
+      : 'The QR needs the portal server. Start it with start.bat and open the address it prints.', 'err');
     return;
   }
 
@@ -256,14 +223,19 @@ function updateUpiBox() {
   linkEl.href = link;
   linkEl.style.display = '';
 
-  // Redraw the QR only when the link changes (the library replaces the element's contents)
+  // Redraw only when the link changes (the library replaces the element's contents)
   if (qrEl.dataset.link !== link) {
     qrEl.innerHTML = '';
     qrEl.dataset.link = link;
-    if (typeof QRCode !== 'undefined') {
+    if (typeof QRCode === 'undefined') {
+      qrEl.innerHTML = '<div class="upi-qr-missing">QR code library did not load.<br/>Pay ' +
+        escapeHtml(_payConfig.upi.vpa) + ' manually.</div>';
+      return;
+    }
+    try {
       new QRCode(qrEl, { text: link, width: 168, height: 168, correctLevel: QRCode.CorrectLevel.M });
-    } else {
-      qrEl.innerHTML = '<div class="upi-qr-missing">QR code library could not load.<br/>Pay ' +
+    } catch (err) {
+      qrEl.innerHTML = '<div class="upi-qr-missing">Could not draw the QR code.<br/>Pay ' +
         escapeHtml(_payConfig.upi.vpa) + ' manually.</div>';
     }
   }
@@ -283,163 +255,13 @@ function copyUpiId() {
     .catch(() => showToast('Could not copy. The UPI ID is ' + _payConfig.upi.vpa, 'info'));
 }
 
-// ===== RAZORPAY =====
-function updateRazorpayBox() {
-  const btn = document.getElementById('rzp-pay-btn');
-  const box = document.getElementById('rzp-box');
-  document.getElementById('rzp-amount').textContent = '₹' + paymentAmount().toLocaleString('en-IN');
-  document.getElementById('rzp-breakdown').textContent = 'Flat re-evaluation fee per request';
-  box.classList.toggle('rzp-paid', Boolean(_rzpPayment));
-
-  const reason = razorpayUnavailableReason();
-  if (reason) {
-    btn.disabled = true;
-    btn.textContent = '💳 Pay with Razorpay';
-    setRazorpayStatus(reason + (isUpiEnabled() ? ' You can pay by UPI instead.' : ''), 'err');
-  } else if (_rzpPayment) {
-    btn.disabled = true;
-    btn.textContent = '✓ Paid';
-    setRazorpayStatus(`Payment verified · ${_rzpPayment.paymentId}`, 'ok');
-  } else {
-    btn.disabled = false;
-    btn.textContent = '💳 Pay with Razorpay';
-  }
-}
-
-function setRazorpayStatus(msg, kind) {
-  const el = document.getElementById('rzp-status');
-  el.textContent = msg;
-  el.className = 'rzp-status' + (kind ? ' ' + kind : '');
-}
-
-async function startRazorpayPayment() {
-  if (!isRazorpayEnabled() || _rzpPayment) return;
-  if (typeof Razorpay === 'undefined') {
-    showToast('Razorpay checkout failed to load. Check your connection.', 'error');
-    return;
-  }
-
-  const btn = document.getElementById('rzp-pay-btn');
-  btn.disabled = true;
-  btn.textContent = 'Creating order...';
-  setRazorpayStatus('', '');
-
-  let order;
-  try {
-    const res = await fetch('/api/payment/order', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        studentEmail: currentUser.email,
-        subject: document.getElementById('f-subject').value,
-        questions: document.getElementById('f-questions').value.trim(),
-      }),
-    });
-    order = await res.json();
-    if (!res.ok) throw new Error(order.error || 'Could not create order');
-  } catch (err) {
-    updateRazorpayBox();
-    setRazorpayStatus('Could not start payment: ' + err.message, 'err');
-    return;
-  }
-
-  const rzp = new Razorpay({
-    key: _payConfig.keyId,
-    order_id: order.orderId,
-    amount: order.amount,
-    currency: order.currency,
-    name: 'IIM Calcutta',
-    description: 'Re-evaluation fee',
-    prefill: {
-      name: document.getElementById('f-name').value.trim() || currentUser.name,
-      email: currentUser.email,
-    },
-    notes: { regNo: document.getElementById('f-regno').value.trim() },
-    theme: { color: '#5D2E0C' },
-    handler: response => verifyRazorpayPayment(response),
-    modal: {
-      ondismiss: () => {
-        updateRazorpayBox();
-        if (!_rzpPayment) setRazorpayStatus('Payment cancelled.', 'err');
-      },
-    },
-  });
-  rzp.on('payment.failed', resp => {
-    setRazorpayStatus('Payment failed: ' + (resp.error && resp.error.description || 'unknown error'), 'err');
-  });
-  btn.textContent = 'Waiting for payment...';
-  rzp.open();
-}
-
-async function verifyRazorpayPayment(response) {
-  setRazorpayStatus('Verifying payment...', '');
-  try {
-    const res = await fetch('/api/payment/verify', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(response),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.verified) throw new Error(data.error || 'Verification failed');
-    _rzpPayment = data;
-    updateRazorpayBox();
-    showToast('Payment successful! You can now submit your request.', 'success');
-  } catch (err) {
-    updateRazorpayBox();
-    setRazorpayStatus('Payment could not be verified: ' + err.message +
-      ` (Payment ID ${response.razorpay_payment_id} — keep this for reference)`, 'err');
-  }
-}
-
 // ===== SUBMISSION =====
-// Returns { ok, fields } for the request record, or { ok: false } after showing an error
+// Returns { ok, fields } for the request record. The office confirms the payment later.
 async function getPaymentForSubmission() {
-  if (_payMethod === 'razorpay') {
-    if (!_rzpPayment) {
-      showToast('Please complete the Razorpay payment first.', 'error');
-      return { ok: false };
-    }
-    return {
-      ok: true,
-      fields: {
-        paymentMethod: 'razorpay',
-        razorpayOrderId: _rzpPayment.orderId,
-        razorpayPaymentId: _rzpPayment.paymentId,
-        amountPaid: _rzpPayment.amount / 100,
-      },
-    };
-  }
-
-  const utr = document.getElementById('f-upi-utr').value.trim();
-  const payerVpa = document.getElementById('f-upi-vpa').value.trim();
-  if (!/^\d{12}$/.test(utr)) {
-    setUpiStatus('Enter the 12-digit UPI reference (UTR) shown in your UPI app after paying.', 'err');
-    showToast('A valid 12-digit UPI reference number is required.', 'error');
-    return { ok: false };
-  }
-  if (!/^[\w.\-]{2,60}@[a-zA-Z]{2,30}$/.test(payerVpa)) {
-    setUpiStatus('Enter the UPI ID you paid from, e.g. name@oksbi. Refunds are sent there.', 'err');
-    showToast('Enter the UPI ID you paid from.', 'error');
-    return { ok: false };
-  }
-  // One UTR can only be used for one request
-  if (_serverMode) {
-    try {
-      const res = await fetch('/api/payment/upi/check?utr=' + encodeURIComponent(utr));
-      const data = await res.json();
-      if (data.used) {
-        setUpiStatus('This UPI reference number has already been used for another request.', 'err');
-        showToast('That UPI reference number is already on file.', 'error');
-        return { ok: false };
-      }
-    } catch { /* offline — the office will catch duplicates */ }
-  }
   return {
     ok: true,
     fields: {
       paymentMethod: 'upi',
-      upiUtr: utr,
-      upiPayerVpa: payerVpa,
       amountPaid: paymentAmount(),
       paymentVerified: false,   // the MBA office confirms this against the bank statement
     },
@@ -480,7 +302,7 @@ function getFeeState(r) {
     return {
       tone: r.paymentVerified ? 'muted' : 'warn',
       label: `Fee paid by UPI · ₹${r.amountPaid}`,
-      detail: `UTR ${r.upiUtr || '—'}${r.paymentVerified ? ' (confirmed by the MBA office)' : ' — the MBA office still has to match this against the bank statement'}. If your marks change, the fee is returned to ${r.upiPayerVpa || 'your UPI ID'} by the office.`,
+      detail: `${r.upiUtr ? 'UTR ' + r.upiUtr + '. ' : ''}${r.paymentVerified ? 'Confirmed by the MBA office.' : 'The MBA office still has to match this against the bank statement.'} If your marks change, the office refunds the fee to ${r.upiPayerVpa || 'the account you paid from'}.`,
     };
   }
   if (REFUND_STATUSES.includes(r.status) && !paidOnline) {
@@ -497,19 +319,15 @@ function feeChip(r) {
   return s ? `<span class="fee-chip fee-${s.tone}">💳 ${escapeHtml(s.label)}</span>` : '';
 }
 
-function feeDetailHtml(r, { allowRetry = false } = {}) {
+function feeDetailHtml(r) {
   const s = getFeeState(r);
   if (!s) return '';
-  const retry = allowRetry && r.refund && r.refund.status === 'failed'
-    ? `<button type="button" class="btn-primary-sm" style="margin-top:10px" onclick="retryRefund('${escapeHtml(r.id)}')">Retry refund</button>`
-    : '';
   return `
     <div class="fee-box fee-${s.tone}">
       <div class="fee-box-label">💳 ${escapeHtml(s.label)}</div>
       <div class="fee-box-detail">${escapeHtml(s.detail)}</div>
       ${r.razorpayPaymentId ? `<div class="fee-box-ids">Payment ${escapeHtml(r.razorpayPaymentId)}${r.refund && r.refund.id ? ' · Refund ' + escapeHtml(r.refund.id) : ''}</div>`
         : r.upiUtr ? `<div class="fee-box-ids">UPI UTR ${escapeHtml(r.upiUtr)} · from ${escapeHtml(r.upiPayerVpa || '—')}</div>` : ''}
-      ${retry}
     </div>`;
 }
 
@@ -532,17 +350,6 @@ async function postRequestAction(id, action, body) {
   return data.request;
 }
 
-async function retryRefund(id) {
-  try {
-    const r = await postRequestAction(id, 'refund', { by: currentUser.email });
-    showToast(r.refund && r.refund.status !== 'failed' ? 'Refund issued.' : 'Refund failed again: ' + (r.refund && r.refund.error), r.refund && r.refund.status !== 'failed' ? 'success' : 'error');
-    openProfReview(id);
-    renderProfRequests(currentProfTab);
-  } catch (err) {
-    showToast('Could not retry refund: ' + err.message, 'error');
-  }
-}
-
 // Pull the latest refund status from Razorpay (used when no webhook is configured)
 async function refreshRefundStatus(id) {
   const r = getRequests().find(x => x.id === id);
@@ -555,8 +362,11 @@ async function refreshRefundStatus(id) {
 
 // ===== HISTORY TIMELINE RENDERER =====
 function renderHistoryTimeline(r) {
+  const forProfessor = currentUser && currentUser.role === 'professor';
   // Build history from the stored array; fall back to synthesised entries for legacy requests
   let entries = Array.isArray(r.history) && r.history.length > 0 ? r.history : [];
+  // Fees and refunds are handled by the MBA office — faculty don't see them
+  if (forProfessor) entries = entries.filter(e => !/^Refund /.test(e.event || ''));
 
   if (entries.length === 0) {
     // Legacy request — synthesise from timestamps
@@ -1215,7 +1025,6 @@ function profCard(r) {
       <span class="meta-item">📅 ${r.examType}</span>
     </div>
     <div class="card-questions">Questions: ${r.questions}</div>
-    ${feeChip(r)}
     <div class="card-footer">
       <span>ID: ${r.id}</span>
       <span>${formatDate(r.createdAt)}</span>
@@ -1245,7 +1054,6 @@ function openProfReview(id) {
         <div class="detail-item detail-full"><label>Questions to Re-Evaluate</label><span>${r.questions}</span></div>
         <div class="detail-item detail-full"><label>Student's Reason</label><span style="white-space:pre-wrap">${r.reason}</span></div>
       </div>
-      ${feeDetailHtml(r, { allowRetry: _serverMode })}
     </div>`;
 
   // A refund can't be undone, so once issued the result must stay "marks changed"
@@ -1253,7 +1061,6 @@ function openProfReview(id) {
   Array.from(document.getElementById('p-status').options).forEach(o => {
     o.disabled = refundLocked && !REFUND_STATUSES.includes(o.value);
   });
-  updateRefundHint();
 
   document.getElementById('p-marks').value = r.updatedMarks || '';
   document.getElementById('p-remarks').value = r.professorRemarks || '';
@@ -1267,26 +1074,6 @@ function openProfReview(id) {
   document.getElementById('prof-request-detail').appendChild(timelineEl);
 
   openModal('prof-review-modal');
-}
-
-// Tells the professor what their chosen result does to the student's fee
-function updateRefundHint() {
-  const el = document.getElementById('p-refund-hint');
-  if (!el) return;
-  const r = getRequests().find(x => x.id === currentProfRequestId);
-  const status = document.getElementById('p-status').value;
-  const paidOnline = r && r.paymentMethod === 'razorpay' && r.razorpayPaymentId;
-  const alreadyRefunded = r && r.refund && r.refund.status !== 'failed' && r.refund.status !== 'manual';
-  let msg = '';
-  if (REFUND_STATUSES.includes(status)) {
-    msg = alreadyRefunded ? 'The fee has already been refunded.'
-      : paidOnline ? `Saving this refunds the student's ₹${r.amountPaid} fee automatically via Razorpay.`
-      : 'Marks changed: the fee is due back to the student (paid by receipt, so the MBA office refunds it manually).';
-  } else if (status === 'Resolved - No Change') {
-    msg = 'Marks unchanged: the re-evaluation fee is retained.';
-  }
-  el.textContent = msg;
-  el.style.display = msg ? '' : 'none';
 }
 
 async function submitProfReview() {
@@ -1308,13 +1095,7 @@ async function submitProfReview() {
       closeModal('prof-review-modal');
       renderProfStats();
       renderProfRequests(currentProfTab);
-      if (r.refund && r.refund.status === 'failed') {
-        showToast('Decision saved, but the refund failed: ' + r.refund.error + '. Open the request to retry.', 'error');
-      } else if (r.refund && (r.refund.status === 'pending' || r.refund.status === 'processed')) {
-        showToast(`Decision saved. ₹${r.refund.amount / 100} refund issued to the student.`, 'success');
-      } else {
-        showToast('Decision saved and student notified.', 'success');
-      }
+      showToast('Decision saved and student notified.', 'success');
     } catch (err) {
       showToast('Could not save decision: ' + err.message, 'error');
     } finally {
