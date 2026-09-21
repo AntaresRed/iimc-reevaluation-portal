@@ -1592,3 +1592,57 @@ body.theme-sage .file-upload-area.has-file {
   color: var(--text-primary);
   padding: 10px 12px;
 }
+
+/* Reviewing professor: search with suggestions */
+.suggest-wrap { position: relative; }
+.suggest-list {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  background: var(--bg-card);
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-modal);
+  max-height: 280px;
+  overflow-y: auto;
+}
+.suggest-item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 9px 12px;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+.suggest-item:last-child { border-bottom: none; }
+.suggest-item:hover, .suggest-item.active { background: var(--iim-cream); }
+.suggest-name { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.suggest-email { font-size: 12px; color: var(--text-muted); }
+.suggest-tag {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--success);
+  background: var(--success-bg);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+.suggest-tag-added { color: var(--info); background: var(--info-bg); }
+.suggest-add { color: var(--iim-brown); font-weight: 700; font-size: 13px; }
+.suggest-empty { padding: 10px 12px; font-size: 13px; color: var(--text-muted); }
+.prof-new {
+  margin-top: 8px;
+  border: 1px dashed var(--border-gold);
+  border-radius: var(--radius-md);
+  background: var(--iim-cream);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.prof-new-title { font-size: 13px; font-weight: 700; color: var(--iim-brown); }
+.prof-new-actions { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+.prof-new-actions > span:last-child { display: inline-flex; gap: 8px; }
+.prof-new[hidden], .suggest-list[hidden] { display: none; }

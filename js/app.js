@@ -117,8 +117,29 @@ function saveRequests(requests) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ requests }),
-    }).catch(() => { _serverMode = false; });
+    }).then(res => { if (!res.ok) throw new Error(); })
+      .catch(() => showToast('Could not save to the server. Check that it is running.', 'error'));
   }
+}
+
+// Read JSON from localStorage without crashing on a damaged or missing value
+function readLocalJson(key, fallback) {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || 'null');
+    return value == null ? fallback : value;
+  } catch { return fallback; }
+}
+
+// Background refresh: updates the cache only when the server answers (never switches to offline mode)
+async function refreshRequests() {
+  if (!_serverMode) return false;
+  try {
+    const res = await fetch(SERVER_API, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return false;
+    _cache = (await res.json()).requests || [];
+    localStorage.setItem('reval_requests', JSON.stringify(_cache));
+    return true;
+  } catch { return false; }
 }
 
 // Create a new request. The server checks the window is open, the section belongs to it,
@@ -155,7 +176,7 @@ async function loadInitialData() {
     console.log(`[Storage] Server mode — ${_cache.length} requests loaded from data/requests.json`);
   } catch {
     // Server not running — use localStorage
-    _cache = JSON.parse(localStorage.getItem('reval_requests') || '[]');
+    _cache = readLocalJson('reval_requests', []);
     _serverMode = false;
     console.log(`[Storage] Offline mode — ${_cache.length} requests loaded from localStorage`);
   }
@@ -302,7 +323,9 @@ function escapeHtml(s) {
 function getFeeState(r) {
   const paidOnline = r.paymentMethod === 'razorpay' && r.razorpayPaymentId;
   const amount = r.refund && r.refund.amount ? r.refund.amount / 100 : r.amountPaid;
-  const refund = r.refund;
+  // A refund that was only due or failed doesn't apply once the result is "No Change"
+  const refund = r.refund && (REFUND_STATUSES.includes(r.status) || r.refund.status === 'pending' || r.refund.status === 'processed')
+    ? r.refund : null;
 
   if (refund && refund.status === 'processed') {
     return { tone: 'ok', label: `Fee refunded · ₹${amount}`, detail: `Refund ${refund.id} processed${refund.processedAt ? ' on ' + formatDate(refund.processedAt) : ''}. It can take 5–7 working days to show in the bank account.` };
@@ -311,7 +334,7 @@ function getFeeState(r) {
     return { tone: 'info', label: `Refund initiated · ₹${amount}`, detail: `Refund ${refund.id} is being processed by Razorpay. Usually 5–7 working days (UPI is often faster).` };
   }
   if (refund && refund.status === 'failed') {
-    return { tone: 'err', label: 'Refund failed', detail: `The refund could not be issued: ${refund.error || 'unknown error'}. The professor or MBA office can retry it.` };
+    return { tone: 'err', label: 'Refund failed', detail: `The refund could not be issued: ${refund.error || 'unknown error'}. The MBA office will follow up.` };
   }
   if (refund && refund.status === 'manual') {
     return { tone: 'warn', label: 'Refund due (manual)', detail: refund.note };
@@ -405,10 +428,10 @@ function renderHistoryTimeline(r) {
     const icon = icons[e.event] || '📌';
     const dotClass = dots[e.event] || 'dot-change';
     const statusChange = (e.from && e.to && e.from !== e.to)
-      ? `<span class="ht-status-change">${e.from} → ${e.to}</span>`
+      ? `<span class="ht-status-change">${escapeHtml(e.from)} → ${escapeHtml(e.to)}</span>`
       : '';
-    const note = e.note ? `<div class="ht-note">${e.note}</div>` : '';
-    const actor = e.by ? `<span class="ht-actor">${e.by}</span>` : '';
+    const note = e.note ? `<div class="ht-note">${escapeHtml(e.note)}</div>` : '';
+    const actor = e.by ? `<span class="ht-actor">${escapeHtml(e.by)}</span>` : '';
     return `
       <div class="ht-entry${isLast ? ' ht-last' : ''}">
         <div class="ht-left">
@@ -417,7 +440,7 @@ function renderHistoryTimeline(r) {
         </div>
         <div class="ht-content">
           <div class="ht-header">
-            <span class="ht-event">${e.event}</span>
+            <span class="ht-event">${escapeHtml(e.event)}</span>
             <span class="ht-time">${formatDateTime(e.at)}</span>
           </div>
           ${statusChange}
@@ -525,9 +548,11 @@ function handleGoogleCredential(response) {
   const errorEl = document.getElementById('google-auth-error');
   if (errorEl) errorEl.textContent = '';
   try {
-    // Decode JWT payload (base64url → JSON, no library needed)
+    // Decode the JWT payload (base64url → UTF-8 JSON) so names with accents or Indic scripts survive
     const base64 = response.credential.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    const payload = JSON.parse(atob(base64));
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+    const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+    const payload = JSON.parse(new TextDecoder().decode(bytes));
     const email = (payload.email || '').toLowerCase();
     const name = payload.name || email.split('@')[0];
     const picture = payload.picture || '';
@@ -609,9 +634,9 @@ function applyUserTheme() {
 function initStudentDashboard() {
   const navUser = document.getElementById('student-nav-user');
   const label = navDisplayLabel();
-  navUser.innerHTML = currentUser.picture
-    ? `<img src="${currentUser.picture}" alt="" class="nav-user-photo"><span>${label}</span>`
-    : label;
+  navUser.innerHTML = (currentUser.picture
+    ? `<img src="${escapeHtml(currentUser.picture)}" alt="" class="nav-user-photo">` : '') +
+    `<span>${escapeHtml(label)}</span>`;
   document.getElementById('student-welcome').textContent =
     'Welcome back, ' + currentUser.name + '! Manage your re-evaluation requests below.';
   renderStudentOpenWindows();
@@ -664,24 +689,24 @@ function renderStudentRequests(tab) {
 function studentCard(r) {
   const hasResult = r.status.startsWith('Resolved');
   const resultAlert = hasResult
-    ? `<div class="card-result-alert ${getResultClass(r.status)}" style="margin-bottom:8px;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;">${r.status}</div>`
+    ? `<div class="card-result-alert ${getResultClass(r.status)}" style="margin-bottom:8px;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:600;">${escapeHtml(r.status)}</div>`
     : '';
   return `
-  <div class="request-card" onclick="openStudentDetail('${r.id}')">
+  <div class="request-card" data-id="${escapeHtml(r.id)}" onclick="openStudentDetail(this.dataset.id)">
     <div class="card-top">
-      <div class="card-subject">${r.subject}</div>
+      <div class="card-subject">${escapeHtml(r.subject)}</div>
       ${getBadge(r.status)}
     </div>
     ${resultAlert}
     <div class="card-meta">
-      <span class="meta-item">📅 ${r.examType}</span>
-      <span class="meta-item">👨‍🏫 ${r.professorName}</span>
-      <span class="meta-item">🏷️ Sec ${r.section}</span>
+      <span class="meta-item">📅 ${escapeHtml(r.examType)}</span>
+      <span class="meta-item">👨‍🏫 ${escapeHtml(r.professorName)}</span>
+      <span class="meta-item">🏷️ Sec ${escapeHtml(r.section || '—')}</span>
     </div>
-    <div class="card-questions">Questions: ${r.questions}</div>
+    <div class="card-questions">Questions: ${escapeHtml(r.questions)}</div>
     ${feeChip(r)}
     <div class="card-footer">
-      <span>ID: ${r.id}</span>
+      <span>ID: ${escapeHtml(r.id)}</span>
       <span>${formatDate(r.createdAt)}</span>
     </div>
   </div>`;
@@ -718,39 +743,41 @@ function openStudentDetail(id) {
     resultHtml = `
     <div class="result-box${boxClass}">
       <h5>Professor's Decision</h5>
-      ${r.updatedMarks ? `<span class="result-marks">${r.updatedMarks}</span>` : ''}
-      ${r.professorRemarks ? `<div class="result-remarks">${r.professorRemarks}</div>` : ''}
+      ${r.updatedMarks ? `<span class="result-marks">${escapeHtml(r.updatedMarks)}</span>` : ''}
+      ${r.professorRemarks ? `<div class="result-remarks">${escapeHtml(r.professorRemarks)}</div>` : ''}
     </div>`;
   }
+
+  const safeUrl = u => /^https:\/\//i.test(u || '') ? escapeHtml(u) : '#';
+  const docs = r.supportingDocs && r.supportingDocs.length
+    ? (r.supportingDocUrls && r.supportingDocUrls.length
+      ? r.supportingDocUrls.map((url, i) => `<a href="${safeUrl(url)}" target="_blank" rel="noopener" style="color:var(--iim-brown);text-decoration:underline">${escapeHtml(r.supportingDocs[i] || 'File ' + (i + 1))} ↗</a>`).join('')
+      : r.supportingDocs.map(n => `<span style="color:#3fb950">✓ ${escapeHtml(n)}</span>`).join(', '))
+    : '';
 
   document.getElementById('student-detail-body').innerHTML = `
     <div class="detail-section">
       <h4>Request Information</h4>
       <div class="detail-grid">
-        <div class="detail-item"><label>Full Name</label><span>${r.studentName}</span></div>
-        <div class="detail-item"><label>Registration No.</label><span>${r.regNo}</span></div>
-        <div class="detail-item"><label>Subject</label><span>${r.subject}</span></div>
-        <div class="detail-item"><label>Section</label><span>${r.section}</span></div>
-        <div class="detail-item"><label>Exam Type</label><span>${r.examType}</span></div>
-        <div class="detail-item"><label>Professor</label><span>${r.professorName}</span></div>
-        <div class="detail-item"><label>Term</label><span>${r.term}</span></div>
+        <div class="detail-item"><label>Full Name</label><span>${escapeHtml(r.studentName)}</span></div>
+        <div class="detail-item"><label>Registration No.</label><span>${escapeHtml(r.regNo)}</span></div>
+        <div class="detail-item"><label>Subject</label><span>${escapeHtml(r.subject)}</span></div>
+        <div class="detail-item"><label>Section</label><span>${escapeHtml(r.section || '—')}</span></div>
+        <div class="detail-item"><label>Exam Type</label><span>${escapeHtml(r.examType)}</span></div>
+        <div class="detail-item"><label>Professor</label><span>${escapeHtml(r.professorName)}</span></div>
+        <div class="detail-item"><label>Term</label><span>${escapeHtml(r.term || '—')}</span></div>
         <div class="detail-item"><label>Status</label><span>${getBadge(r.status)}</span></div>
-        <div class="detail-item detail-full"><label>Questions</label><span>${r.questions}</span></div>
-        <div class="detail-item detail-full"><label>Reason for Re-Evaluation</label><span style="white-space:pre-wrap">${r.reason}</span></div>
+        <div class="detail-item detail-full"><label>Questions</label><span>${escapeHtml(r.questions)}</span></div>
+        <div class="detail-item detail-full"><label>Reason for Re-Evaluation</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>
         <div class="detail-item"><label>Submitted On</label><span>${formatDate(r.createdAt)}</span></div>
-        <div class="detail-item"><label>Request ID</label><span style="font-family:monospace;font-size:12px">${r.id}</span></div>
+        <div class="detail-item"><label>Request ID</label><span style="font-family:monospace;font-size:12px">${escapeHtml(r.id)}</span></div>
         ${r.upiUtr ? `
         <div class="detail-item"><label>Paid by UPI</label><span style="font-family:monospace;font-size:12px">UTR ${escapeHtml(r.upiUtr)}</span></div>
         <div class="detail-item"><label>Refund goes to</label><span style="font-family:monospace;font-size:12px">${escapeHtml(r.upiPayerVpa || '—')}</span></div>` : ''}
         ${!r.paymentFileName && !r.paymentUrl ? '' : `<div class="detail-item"><label>Payment Proof</label><span>${r.paymentUrl
-      ? `<a href="${r.paymentUrl}" target="_blank" style="color:var(--iim-brown);text-decoration:underline">View receipt ↗</a>`
-      : '<span style="color:#3fb950">✓ Uploaded (local)</span>'
-    }</span></div>`}
-        ${r.supportingDocs && r.supportingDocs.length ? `
-        <div class="detail-item detail-full"><label>Supporting Docs</label><span style="display:flex;flex-wrap:wrap;gap:8px">${r.supportingDocUrls && r.supportingDocUrls.length
-        ? r.supportingDocUrls.map((url, i) => `<a href="${url}" target="_blank" style="color:var(--iim-brown);text-decoration:underline">${r.supportingDocs[i] || 'File ' + (i + 1)} ↗</a>`).join('')
-        : r.supportingDocs.map(n => `<span style="color:#3fb950">✓ ${n}</span>`).join(', ')
-      }</span></div>` : ''}
+          ? `<a href="${safeUrl(r.paymentUrl)}" target="_blank" rel="noopener" style="color:var(--iim-brown);text-decoration:underline">View receipt ↗</a>`
+          : '<span style="color:#3fb950">✓ Uploaded (local)</span>'}</span></div>`}
+        ${docs ? `<div class="detail-item detail-full"><label>Supporting Docs</label><span style="display:flex;flex-wrap:wrap;gap:8px">${docs}</span></div>` : ''}
       </div>
     </div>
     ${feeDetailHtml(r)}
@@ -791,8 +818,13 @@ function showStudentForm(windowId) {
 function handleDocsUpload(input) {
   if (input.files && input.files.length > 0) {
     const oversized = Array.from(input.files).find(f => f.size > 5 * 1024 * 1024);
-    if (oversized) { showToast(`"${oversized.name}" exceeds 5MB limit.`, 'error'); return; }
-    const names = Array.from(input.files).map(f => f.name).join(', ');
+    if (oversized) {
+      showToast(`"${oversized.name}" exceeds the 5MB limit. Please choose smaller files.`, 'error');
+      input.value = '';   // otherwise the rejected files would still be submitted
+      document.getElementById('docs-upload-area').classList.remove('has-file');
+      return;
+    }
+    const names = escapeHtml(Array.from(input.files).map(f => f.name).join(', '));
     const totalKb = Array.from(input.files).reduce((s, f) => s + f.size, 0) / 1024;
     document.getElementById('docs-upload-content').innerHTML = `
       <span class="file-upload-icon">✅</span>
@@ -876,9 +908,9 @@ async function submitRevalForm(e) {
 function initProfDashboard() {
   const navUser = document.getElementById('prof-nav-user');
   const label = navDisplayLabel();
-  navUser.innerHTML = currentUser.picture
-    ? `<img src="${currentUser.picture}" alt="" class="nav-user-photo"><span>${label}</span>`
-    : label;
+  navUser.innerHTML = (currentUser.picture
+    ? `<img src="${escapeHtml(currentUser.picture)}" alt="" class="nav-user-photo">` : '') +
+    `<span>${escapeHtml(label)}</span>`;
 
   // Show this professor's known subjects and sections
   const entries = getProfMapEntriesForUser();
@@ -900,16 +932,9 @@ function initProfDashboard() {
 // Get all requests that belong to this professor
 // Matching is done by exact professor name from the mapping
 function getProfRequests() {
-  const all = getRequests();
-  const myEntries = getProfMapEntriesForUser();
-  const myNames = new Set(myEntries.map(e => e.professor));
-
-  if (myNames.size === 0) {
-    // Fallback: fuzzy match by email prefix
-    const profKeyword = currentUser.name.toLowerCase().replace(/[._-]/g, ' ');
-    return all.filter(r => r.professorName.toLowerCase().includes(profKeyword.split(' ')[0]));
-  }
-  return all.filter(r => myNames.has(r.professorName));
+  const myName = resolveProfessorName(currentUser.email);
+  if (!myName) return [];
+  return getRequests().filter(r => r.professorName === myName);
 }
 
 function renderProfStats() {
@@ -944,7 +969,7 @@ function renderProfRequests(tab) {
     <div class="empty-state">
       <div class="empty-icon">📭</div>
       <p>No requests in this category.</p>
-      <button class="btn-primary-sm" onclick="loadDemoData()">Load demo requests</button>
+      ${_serverMode ? '' : '<button class="btn-primary-sm" onclick="loadDemoData()">Load demo requests</button>'}
     </div>`;
     return;
   }
@@ -954,20 +979,20 @@ function renderProfRequests(tab) {
 
 function profCard(r) {
   return `
-  <div class="request-card" onclick="openProfReview('${r.id}')">
+  <div class="request-card" data-id="${escapeHtml(r.id)}" onclick="openProfReview(this.dataset.id)">
     <div class="card-top">
-      <div class="card-subject">${r.subject}</div>
+      <div class="card-subject">${escapeHtml(r.subject)}</div>
       ${getBadge(r.status)}
     </div>
     <div class="card-meta">
-      <span class="meta-item">🎓 ${r.studentName}</span>
-      <span class="meta-item">📋 ${r.regNo}</span>
-      <span class="meta-item">🏷️ Sec ${r.section || '—'}</span>
-      <span class="meta-item">📅 ${r.examType}</span>
+      <span class="meta-item">🎓 ${escapeHtml(r.studentName)}</span>
+      <span class="meta-item">📋 ${escapeHtml(r.regNo)}</span>
+      <span class="meta-item">🏷️ Sec ${escapeHtml(r.section || '—')}</span>
+      <span class="meta-item">📅 ${escapeHtml(r.examType)}</span>
     </div>
-    <div class="card-questions">Questions: ${r.questions}</div>
+    <div class="card-questions">Questions: ${escapeHtml(r.questions)}</div>
     <div class="card-footer">
-      <span>ID: ${r.id}</span>
+      <span>ID: ${escapeHtml(r.id)}</span>
       <span>${formatDate(r.createdAt)}</span>
     </div>
   </div>`;
@@ -985,15 +1010,15 @@ function openProfReview(id) {
     <div class="detail-section">
       <h4>Student's Request</h4>
       <div class="detail-grid">
-        <div class="detail-item"><label>Student Name</label><span>${r.studentName}</span></div>
-        <div class="detail-item"><label>Registration No.</label><span>${r.regNo}</span></div>
-        <div class="detail-item"><label>Subject / Course</label><span>${r.subject}</span></div>
-        <div class="detail-item"><label>Section</label><span>${r.section || '—'}</span></div>
-        <div class="detail-item"><label>Exam Type</label><span>${r.examType}</span></div>
-        <div class="detail-item"><label>Academic Term</label><span>${r.term || '—'}</span></div>
+        <div class="detail-item"><label>Student Name</label><span>${escapeHtml(r.studentName)}</span></div>
+        <div class="detail-item"><label>Registration No.</label><span>${escapeHtml(r.regNo)}</span></div>
+        <div class="detail-item"><label>Subject / Course</label><span>${escapeHtml(r.subject)}</span></div>
+        <div class="detail-item"><label>Section</label><span>${escapeHtml(r.section || '—')}</span></div>
+        <div class="detail-item"><label>Exam Type</label><span>${escapeHtml(r.examType)}</span></div>
+        <div class="detail-item"><label>Academic Term</label><span>${escapeHtml(r.term || '—')}</span></div>
         <div class="detail-item"><label>Current Status</label><span>${getBadge(r.status)}</span></div>
-        <div class="detail-item detail-full"><label>Questions to Re-Evaluate</label><span>${r.questions}</span></div>
-        <div class="detail-item detail-full"><label>Student's Reason</label><span style="white-space:pre-wrap">${r.reason}</span></div>
+        <div class="detail-item detail-full"><label>Questions to Re-Evaluate</label><span>${escapeHtml(r.questions)}</span></div>
+        <div class="detail-item detail-full"><label>Student's Reason</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>
       </div>
     </div>`;
 
@@ -1154,17 +1179,20 @@ document.querySelectorAll('.modal-overlay').forEach(overlay => {
 });
 
 // ===== TOAST =====
+let _toastTimer = null;
 function showToast(msg, type = 'info') {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.className = `toast ${type} show`;
-  setTimeout(() => t.classList.remove('show'), 3500);
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
 // ===== SESSION RESTORE =====
 window.addEventListener('DOMContentLoaded', async () => {
   // Load data from server (or localStorage fallback) before rendering anything
   await loadInitialData();
+  await loadFaculty();
   await loadWindows();
   await loadPaymentConfig();
 
@@ -1563,6 +1591,7 @@ function showWindowForm(editId) {
   }
   onWindowSubjectChange(w ? w.sections : []);
   onWindowExamTypeChange(false);
+  document.getElementById('w-prof-new').hidden = true;
   if (w && !w.sections.length) document.getElementById('w-prof').value = w.professor || '';
 
   // Times: new windows open now for 24 hours; edits keep their own times
@@ -1642,19 +1671,187 @@ function toggleAllSections() {
 // With no section ticked, the admin names the professor who reviews every request
 function updateWindowProfessorField() {
   const group = document.getElementById('w-prof-group');
-  const sel = document.getElementById('w-prof');
   const needed = !!document.getElementById('w-subject').value && tickedSections().length === 0;
   group.style.display = needed ? '' : 'none';
-  sel.required = needed;
-  if (!needed) return;
+  document.getElementById('w-prof').required = needed;
+  if (!needed) {
+    hideProfSuggestions();
+    document.getElementById('w-prof-new').hidden = true;
+  }
+}
 
-  const teaching = [...new Set(getEntriesForSubject(selectedWindowSubject()).map(e => e.professor))];
-  const others = Object.keys(PROF_EMAILS).filter(p => !teaching.includes(p));
-  const keep = sel.value;
-  sel.innerHTML = '<option value="">Select professor</option>' +
-    (teaching.length ? `<optgroup label="Teaches this subject">${teaching.map(optionHtml).join('')}</optgroup>` : '') +
-    `<optgroup label="${teaching.length ? 'Other faculty' : 'Faculty'}">${others.map(optionHtml).join('')}</optgroup>`;
-  if (keep) sel.value = keep;
+// ----- Faculty directory -----
+// Built-in professors come from PROF_EMAILS; the office can add more, which are stored on the server
+// and merged in here so they can sign in, be suggested, and review requests.
+let _addedFaculty = [];
+
+async function loadFaculty() {
+  let list = [];
+  if (_serverMode) {
+    try {
+      const res = await fetch('/api/faculty', { signal: AbortSignal.timeout(1500) });
+      if (res.ok) {
+        list = (await res.json()).faculty || [];
+        localStorage.setItem('reval_faculty', JSON.stringify(list));
+      }
+    } catch { /* fall back to the local copy */ }
+  }
+  if (!list.length) {
+    try { list = JSON.parse(localStorage.getItem('reval_faculty') || '[]'); } catch { list = []; }
+  }
+  list.forEach(registerFaculty);
+}
+
+function registerFaculty(f) {
+  PROF_EMAILS[f.name] = f.email;
+  EMAIL_TO_PROF[f.email] = f.name;
+  if (!_addedFaculty.some(x => x.email === f.email)) _addedFaculty.push(f);
+}
+
+function facultyList() {
+  return Object.entries(PROF_EMAILS).map(([name, email]) => ({
+    name, email, added: _addedFaculty.some(f => f.email === email),
+  }));
+}
+
+function isKnownProfessor(name) {
+  return Object.prototype.hasOwnProperty.call(PROF_EMAILS, name);
+}
+
+// ----- Reviewing professor: search + suggestions -----
+let _profSuggestIndex = -1;
+
+function renderProfSuggestions() {
+  const input = document.getElementById('w-prof');
+  const box = document.getElementById('w-prof-suggestions');
+  if (input.disabled) return;
+  const typed = input.value.trim();
+  const q = typed.toLowerCase();
+  const teaching = new Set(getEntriesForSubject(selectedWindowSubject()).map(e => e.professor));
+
+  // Match on name or email; professors who teach the subject come first
+  const matches = facultyList()
+    .filter(f => !q || f.name.toLowerCase().includes(q) || f.email.includes(q))
+    .sort((a, b) => (teaching.has(b.name) - teaching.has(a.name)) || a.name.localeCompare(b.name))
+    .slice(0, 8);
+
+  const items = matches.map(f => `
+    <div class="suggest-item" data-name="${escapeHtml(f.name)}" onmousedown="event.preventDefault(); pickProfessor(this.dataset.name)">
+      <span class="suggest-name">${escapeHtml(f.name)}</span>
+      <span class="suggest-email">${escapeHtml(f.email)}</span>
+      ${teaching.has(f.name) ? '<span class="suggest-tag">Teaches this subject</span>' : ''}
+      ${f.added ? '<span class="suggest-tag suggest-tag-added">Added by office</span>' : ''}
+    </div>`);
+
+  // Offer to add whoever was typed if they aren't in the directory
+  const exact = facultyList().some(f => f.name.toLowerCase() === q);
+  if (typed && !exact) {
+    items.push(`<div class="suggest-item suggest-add" onmousedown="event.preventDefault(); startAddProfessor()">
+      + Add “${escapeHtml(typed)}” as a new professor</div>`);
+  }
+  if (!items.length) {
+    items.push('<div class="suggest-empty">No faculty found.</div>');
+  }
+  box.innerHTML = items.join('');
+  box.hidden = false;
+  _profSuggestIndex = -1;
+}
+
+function onProfInput() {
+  document.getElementById('w-prof-new').hidden = true;
+  renderProfSuggestions();
+}
+
+function hideProfSuggestions() {
+  const box = document.getElementById('w-prof-suggestions');
+  if (box) box.hidden = true;
+  _profSuggestIndex = -1;
+}
+
+function pickProfessor(name) {
+  document.getElementById('w-prof').value = name;
+  document.getElementById('w-prof-new').hidden = true;
+  hideProfSuggestions();
+}
+
+// Arrow keys move through suggestions, Enter picks, Escape closes (Enter never submits the form here)
+function onProfKeydown(e) {
+  const box = document.getElementById('w-prof-suggestions');
+  const items = Array.from(box.querySelectorAll('.suggest-item'));
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (box.hidden) { renderProfSuggestions(); return; }
+    if (!items.length) return;
+    _profSuggestIndex = (_profSuggestIndex + (e.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length;
+    items.forEach((it, i) => it.classList.toggle('active', i === _profSuggestIndex));
+    items[_profSuggestIndex].scrollIntoView({ block: 'nearest' });
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const chosen = items[_profSuggestIndex] || (items.length === 1 ? items[0] : null);
+    if (!chosen) return;
+    if (chosen.classList.contains('suggest-add')) startAddProfessor();
+    else pickProfessor(chosen.dataset.name);
+  } else if (e.key === 'Escape') {
+    hideProfSuggestions();
+  }
+}
+
+function startAddProfessor() {
+  const typed = document.getElementById('w-prof').value.trim();
+  hideProfSuggestions();
+  document.getElementById('w-prof-new').hidden = false;
+  document.getElementById('w-prof-new-name').value = typed;
+  document.getElementById('w-prof-new-email').value = '';
+  document.getElementById('w-prof-new-email').focus();
+}
+
+function cancelAddProfessor() {
+  document.getElementById('w-prof-new').hidden = true;
+  document.getElementById('w-prof').focus();
+}
+
+function onNewProfKeydown(e) {
+  if (e.key === 'Enter') { e.preventDefault(); addNewProfessor(); }
+  if (e.key === 'Escape') cancelAddProfessor();
+}
+
+async function addNewProfessor() {
+  let name = document.getElementById('w-prof-new-name').value.replace(/\s+/g, ' ').trim();
+  const email = document.getElementById('w-prof-new-email').value.trim().toLowerCase();
+  if (!name) { showToast('Please enter the professor\'s name.', 'error'); return; }
+  if (!/^prof\.?\s/i.test(name)) name = 'Prof. ' + name;   // match the directory's naming
+  if (!/^[a-z0-9._%+-]+@email\.iimcal\.ac\.in$/.test(email)) {
+    showToast('Please enter the professor\'s @email.iimcal.ac.in address.', 'error');
+    return;
+  }
+  const clash = facultyList().find(f => f.email === email || f.name.toLowerCase() === name.toLowerCase());
+  if (clash) {
+    showToast(`${clash.name} (${clash.email}) is already in the faculty list.`, 'info');
+    pickProfessor(clash.name);
+    return;
+  }
+
+  let saved = { name, email, addedBy: currentUser.email, addedAt: Date.now() };
+  if (_serverMode) {
+    try {
+      const res = await fetch('/api/faculty', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(saved),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not add the professor');
+      saved = data.faculty;
+    } catch (err) {
+      showToast(err.message, 'error');
+      return;
+    }
+  }
+  registerFaculty(saved);
+  localStorage.setItem('reval_faculty', JSON.stringify(_addedFaculty));
+  populateCreds();
+  pickProfessor(saved.name);
+  showToast(`${saved.name} added to the faculty list.`, 'success');
 }
 
 function onWindowExamTypeChange(focus = true) {
@@ -1710,7 +1907,7 @@ async function submitWindowForm(e) {
     courseCode: document.getElementById('w-code').value.trim(),
     examType,
     sections,
-    professor: sections.length ? '' : document.getElementById('w-prof').value,
+    professor: sections.length ? '' : document.getElementById('w-prof').value.trim(),
     term: document.getElementById('w-term').value.trim(),
     startsAt: fromLocalInput(document.getElementById('w-start').value),
     endsAt: fromLocalInput(document.getElementById('w-end').value),
@@ -1720,6 +1917,10 @@ async function submitWindowForm(e) {
   if (!examType) { showToast('Please choose or enter the type of exam.', 'error'); return; }
   if (!payload.term) { showToast('Please enter the term.', 'error'); return; }
   if (!sections.length && !payload.professor) { showToast('No section is selected, so please choose the reviewing professor.', 'error'); return; }
+  if (!sections.length && !isKnownProfessor(payload.professor)) {
+    showToast('Pick the professor from the suggestions, or add them as a new professor.', 'error');
+    return;
+  }
   if (!(payload.endsAt > payload.startsAt)) { showToast('The window must close after it opens.', 'error'); return; }
   if (payload.endsAt <= Date.now()) { showToast('The closing time is already in the past.', 'error'); return; }
 
@@ -1785,6 +1986,7 @@ async function endWindow(id) {
 
 // ----- Routing and refresh -----
 function openDashboardForRole() {
+  applyUserTheme();
   if (currentUser.role === 'admin') {
     showPage('page-admin');
     initAdminDashboard();
@@ -1797,17 +1999,21 @@ function openDashboardForRole() {
   }
 }
 
-// Every 30s: pick up windows opened elsewhere and keep countdowns current
+// Every 30s: pick up windows and requests changed elsewhere, and keep countdowns current
 setInterval(async () => {
   if (!currentUser) return;
-  await loadWindows();
+  await Promise.all([loadWindows(), refreshRequests()]);
+  if (!currentUser) return;   // signed out while refreshing
   if (currentUser.role === 'admin') {
-    if (_serverMode) await loadInitialData();
     renderAdminDashboard();
   } else if (currentUser.role === 'professor') {
     renderProfOpenWindows();
+    renderProfStats();
+    renderProfRequests(currentProfTab);
   } else {
     renderStudentOpenWindows();
+    renderStudentStats();
+    renderStudentRequests(currentStudentTab);
   }
 }, 30000);
 
@@ -1817,8 +2023,9 @@ function populateCreds() {
   if (!container) return;
   container.innerHTML = Object.entries(PROF_EMAILS).map(([name, email]) => `
     <div class="cred-row">
-      <span class="cred-name">${name.replace('Prof. ', '')}</span>
-      <span class="cred-email" title="Click to log in as ${name}" onclick="testLoginAsFaculty('${email}', '${name}')">${email}</span>
+      <span class="cred-name">${escapeHtml(name.replace('Prof. ', ''))}</span>
+      <span class="cred-email" title="Click to log in as ${escapeHtml(name)}" data-email="${escapeHtml(email)}" data-name="${escapeHtml(name)}"
+        onclick="testLoginAsFaculty(this.dataset.email, this.dataset.name)">${escapeHtml(email)}</span>
     </div>`).join('');
 }
 
@@ -1828,8 +2035,9 @@ function populateAdminCreds() {
   if (!container) return;
   container.innerHTML = ADMIN_ACCOUNTS.map(a => `
     <div class="cred-row">
-      <span class="cred-name">${a.name}</span>
-      <span class="cred-email" title="Click to log in as ${a.name}" onclick="testLoginAsAdmin('${a.email}', '${a.name}')">${a.email}</span>
+      <span class="cred-name">${escapeHtml(a.name)}</span>
+      <span class="cred-email" title="Click to log in as ${escapeHtml(a.name)}" data-email="${escapeHtml(a.email)}" data-name="${escapeHtml(a.name)}"
+        onclick="testLoginAsAdmin(this.dataset.email, this.dataset.name)">${escapeHtml(a.email)}</span>
     </div>`).join('');
 }
 
@@ -1843,8 +2051,7 @@ function testLoginAsAdmin(email, name) {
 function testLoginAsFaculty(email, name) {
   currentUser = { email: email.toLowerCase(), name: name, role: 'professor', picture: '' };
   localStorage.setItem('reval_session', JSON.stringify(currentUser));
-  showPage('page-professor');
-  initProfDashboard();
+  openDashboardForRole();
   showToast('DEV login: ' + name, 'info');
 }
 
@@ -1972,12 +2179,11 @@ const NORMAL_LABELS = ['Total Requests', 'Pending', 'Under Review', 'Resolved'];
 
 function togglePeaceful() {
   _peacefulMode = !_peacefulMode;
-  ['peaceful-toggle-student', 'peaceful-toggle-prof'].forEach(function (id) {
-    const btn = document.getElementById(id);
-    if (!btn) return;
-    btn.textContent = _peacefulMode ? 'Intense' : 'Peaceful';
+  const btn = document.getElementById('peaceful-toggle-student');
+  if (btn) {
+    btn.textContent = _peacefulMode ? '🔥 Intense' : '🧘 Peaceful';
     btn.classList.toggle('peaceful-active', _peacefulMode);
-  });
+  }
   if (currentUser && currentUser.role === 'student') {
     renderStudentStats();
     showToast(_peacefulMode ? 'Peaceful mode. Breathe.' : 'Intense mode. Grind on.', 'info');

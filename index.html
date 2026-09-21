@@ -26,7 +26,7 @@
     href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap"
     rel="stylesheet" />
   <link rel="icon" type="image/png" href="assets/browser_logo.png" />
-  <link rel="stylesheet" href="css/style.css?v=5" />
+  <link rel="stylesheet" href="css/style.css?v=6" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="js/vendor/qrcode.min.js"></script>
 </head>
@@ -427,7 +427,25 @@
             </div>
             <div class="form-group" id="w-prof-group" style="display:none">
               <label>Reviewing Professor *</label>
-              <select id="w-prof"></select>
+              <div class="suggest-wrap">
+                <input type="text" id="w-prof" autocomplete="off" placeholder="Search faculty by name or email…"
+                  oninput="onProfInput()" onfocus="renderProfSuggestions()" onkeydown="onProfKeydown(event)" onblur="hideProfSuggestions()" />
+                <div class="suggest-list" id="w-prof-suggestions" hidden></div>
+              </div>
+              <div class="prof-new" id="w-prof-new" hidden>
+                <div class="prof-new-title">Add a new professor</div>
+                <div class="form-grid-2">
+                  <input type="text" id="w-prof-new-name" maxlength="120" placeholder="Full name, e.g. Prof. Amit Sen" onkeydown="onNewProfKeydown(event)" />
+                  <input type="email" id="w-prof-new-email" maxlength="200" placeholder="name@email.iimcal.ac.in" onkeydown="onNewProfKeydown(event)" />
+                </div>
+                <div class="prof-new-actions">
+                  <span class="section-picker-hint">They can then sign in with this email to review requests.</span>
+                  <span>
+                    <button type="button" class="btn-secondary btn-end" onclick="cancelAddProfessor()">Cancel</button>
+                    <button type="button" class="btn-primary-sm" onclick="addNewProfessor()">Add professor</button>
+                  </span>
+                </div>
+              </div>
               <div class="section-picker-hint">No section is selected, so every student of this subject can apply and all requests go to this professor.</div>
             </div>
             <div class="form-grid-2">
@@ -472,7 +490,7 @@
   <!-- Toast -->
   <div id="toast" class="toast"></div>
 
-  <script src="js/app.js?v=5"></script>
+  <script src="js/app.js?v=6"></script>
 </body>
 
 </html>

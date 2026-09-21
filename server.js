@@ -31,6 +31,7 @@ const DATA_FILE = path.join(DATA_DIR, 'requests.json');
 const ARCHIVE_FILE = path.join(DATA_DIR, 'archive.json');
 const PAYMENTS_FILE = path.join(DATA_DIR, 'payments.json');
 const WINDOWS_FILE = path.join(DATA_DIR, 'windows.json');
+const FACULTY_FILE = path.join(DATA_DIR, 'faculty.json');
 
 // ===== RAZORPAY CONFIG (POC) =====
 // Put RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env (use rzp_test_ keys while testing).
@@ -66,18 +67,39 @@ const MIME_TYPES = {
   '.webp': 'image/webp',
 };
 
+// ===== JSON FILE STORAGE =====
+// Writes go to a temp file that is then renamed over the real one, so a crash mid-write can't
+// leave half a file behind. A file that exists but can't be parsed is set aside (never silently
+// replaced by an empty one, which would wipe every request on the next save).
+function readJsonFile(file, fallback) {
+  if (!fs.existsSync(file)) return fallback();
+  const text = fs.readFileSync(file, 'utf8');
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const saved = `${file}.corrupt-${Date.now()}`;
+    fs.copyFileSync(file, saved);
+    console.error(`  ⚠️  ${path.basename(file)} could not be read (${e.message}). A copy was kept at ${saved}.`);
+    throw new Error(`${path.basename(file)} is damaged; a copy was kept at ${path.basename(saved)}. Fix or remove it before saving.`);
+  }
+}
+
+function writeJsonFile(file, obj) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+  fs.renameSync(tmp, file);
+}
+
 function readData() {
-  try { return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); }
-  catch { return { requests: [] }; }
+  return readJsonFile(DATA_FILE, () => ({ requests: [] }));
 }
 
 function writeData(obj) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  writeJsonFile(DATA_FILE, obj);
 }
 
 function readArchive() {
-  try { return JSON.parse(fs.readFileSync(ARCHIVE_FILE, 'utf8')); }
-  catch { return { entries: [] }; }
+  return readJsonFile(ARCHIVE_FILE, () => ({ entries: [] }));
 }
 
 /**
@@ -89,25 +111,27 @@ function readArchive() {
  */
 function archiveRequests(newRequests) {
   const archive = readArchive();
-  const existing = new Map(archive.entries.map(e => [e.id + '_' + e.archivedAt, true]));
+  // Latest snapshot per request, found in one pass
+  const latest = new Map();
+  for (const e of archive.entries) latest.set(e.id, e);
 
   let changed = false;
   for (const req of newRequests) {
     // Check if we already have this exact version archived
-    const lastEntry = archive.entries.filter(e => e.id === req.id).pop();
+    const lastEntry = latest.get(req.id);
     const isNew = !lastEntry;
     const hasChanged = lastEntry && (lastEntry.status !== req.status ||
       JSON.stringify(lastEntry.history) !== JSON.stringify(req.history));
 
     if (isNew || hasChanged) {
-      archive.entries.push({ ...req, archivedAt: Date.now() });
+      const snapshot = { ...req, archivedAt: Date.now() };
+      archive.entries.push(snapshot);
+      latest.set(req.id, snapshot);
       changed = true;
     }
   }
 
-  if (changed) {
-    fs.writeFileSync(ARCHIVE_FILE, JSON.stringify(archive, null, 2), 'utf8');
-  }
+  if (changed) writeJsonFile(ARCHIVE_FILE, archive);
 }
 
 // ===== RAZORPAY HELPERS =====
@@ -116,16 +140,30 @@ function sendJson(res, status, obj) {
   res.end(JSON.stringify(obj));
 }
 
-function readJsonBody(req) {
+// Request bodies are capped so one oversized upload can't exhaust the server's memory
+const MAX_BODY_BYTES = 1048576;
+
+function readRawBody(req) {
   return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
+    const chunks = [];
+    let size = 0;
+    req.on('data', chunk => {
+      size += chunk.length;
+      if (size <= MAX_BODY_BYTES) chunks.push(chunk);   // keep draining, but stop storing
+    });
     req.on('end', () => {
-      try { resolve(body ? JSON.parse(body) : {}); }
-      catch (e) { reject(e); }
+      if (size > MAX_BODY_BYTES) reject(new Error('Request is too large.'));
+      else resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
   });
+}
+
+async function readJsonBody(req) {
+  const raw = await readRawBody(req);
+  if (!raw.length) return {};
+  try { return JSON.parse(raw.toString('utf8')); }
+  catch { throw new Error('The request body is not valid JSON.'); }
 }
 
 // Minimal Razorpay REST client: https://razorpay.com/docs/api/orders/
@@ -167,33 +205,22 @@ function isValidPaymentSignature(orderId, paymentId, signature) {
 }
 
 function readPayments() {
-  try { return JSON.parse(fs.readFileSync(PAYMENTS_FILE, 'utf8')); }
-  catch { return { payments: [] }; }
+  return readJsonFile(PAYMENTS_FILE, () => ({ payments: [] }));
 }
 
 function recordVerifiedPayment(entry) {
   const store = readPayments();
   if (store.payments.some(p => p.paymentId === entry.paymentId)) return;
   store.payments.push(entry);
-  fs.writeFileSync(PAYMENTS_FILE, JSON.stringify(store, null, 2), 'utf8');
-}
-
-function readRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
-  });
+  writeJsonFile(PAYMENTS_FILE, store);
 }
 
 // ===== FEE REFUND POLICY =====
 // Digital version of the demand-draft process: the fee is collected at submission,
 // refunded if the marks change (up or down), and retained if they don't.
 const REFUND_STATUSES = ['Resolved - Marks Increased', 'Resolved - Marks Decreased'];
-// Server-owned fields: the browser's bulk save can never overwrite these
+// Fields a review/refund action owns (copied onto the latest saved copy after a Razorpay call)
 const REVIEW_FIELDS = ['status', 'updatedMarks', 'professorRemarks', 'reviewedAt', 'history', 'refund', 'paymentVerified'];
-
 function isRefundActive(refund) {
   return Boolean(refund && (refund.status === 'pending' || refund.status === 'processed'));
 }
@@ -267,12 +294,11 @@ async function issueRefund(request, actor) {
 const SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F'];
 
 function readWindows() {
-  try { return JSON.parse(fs.readFileSync(WINDOWS_FILE, 'utf8')); }
-  catch { return { windows: [] }; }
+  return readJsonFile(WINDOWS_FILE, () => ({ windows: [] }));
 }
 
 function writeWindows(obj) {
-  fs.writeFileSync(WINDOWS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+  writeJsonFile(WINDOWS_FILE, obj);
 }
 
 // scheduled → open → closed (closed early when an admin ends it)
@@ -436,6 +462,42 @@ async function handleWindows(req, res) {
   return false;
 }
 
+// ===== FACULTY ADDED BY THE OFFICE =====
+// The built-in professor list lives in the page; professors the office adds are stored here,
+// so they can sign in with their IIMC email and review requests.
+const IIMC_EMAIL = /^[a-z0-9._%+-]+@email\.iimcal\.ac\.in$/;
+
+function readFaculty() {
+  return readJsonFile(FACULTY_FILE, () => ({ faculty: [] }));
+}
+
+async function handleFaculty(req, res) {
+  if (req.url === '/api/faculty' && req.method === 'GET') {
+    sendJson(res, 200, readFaculty());
+    return true;
+  }
+  if (req.url === '/api/faculty' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      const name = cleanText(body.name, 120);
+      const email = cleanText(body.email, 200).toLowerCase();
+      if (!name) { sendJson(res, 400, { error: 'Please enter the professor\'s name.' }); return true; }
+      if (!IIMC_EMAIL.test(email)) { sendJson(res, 400, { error: 'Please enter an @email.iimcal.ac.in address.' }); return true; }
+      const store = readFaculty();
+      if (store.faculty.some(f => f.email === email)) { sendJson(res, 409, { error: 'A professor with this email has already been added.' }); return true; }
+      if (store.faculty.some(f => f.name.toLowerCase() === name.toLowerCase())) { sendJson(res, 409, { error: 'A professor with this name has already been added.' }); return true; }
+      const entry = { name, email, addedBy: cleanText(body.addedBy, 200), addedAt: Date.now() };
+      store.faculty.push(entry);
+      writeJsonFile(FACULTY_FILE, store);
+      sendJson(res, 200, { faculty: entry });
+    } catch (e) {
+      sendJson(res, 400, { error: e.message });
+    }
+    return true;
+  }
+  return false;
+}
+
 // POST /api/requests/submit — the only way a new request is created
 async function handleSubmitRequest(req, res) {
   try {
@@ -461,31 +523,42 @@ async function handleSubmitRequest(req, res) {
       sendJson(res, 409, { error: 'You have already applied for re-evaluation in this window.' });
       return;
     }
-    if (incoming.upiUtr && data.requests.some(r => r.upiUtr === incoming.upiUtr)) {
-      sendJson(res, 409, { error: 'That UPI reference number is already used by another request.' });
-      return;
-    }
-
-    // Exam details come from the window, never from the browser; review fields start empty
-    const { refund, paymentVerified, reviewedAt, updatedMarks, professorRemarks, history, status, ...fresh } = incoming;
+    // Only known fields are accepted; exam details come from the window and review fields start empty
     const now = Date.now();
+    const text = (key, max) => cleanText(incoming[key], max);
+    const section = SECTIONS.includes(incoming.section) ? incoming.section : '';
     const request = {
-      ...fresh,
-      id: cleanText(fresh.id, 60) || 'IIMC-' + now.toString(36).toUpperCase(),
-      studentEmail: email,
+      id: /^[A-Za-z0-9-]{1,60}$/.test(String(incoming.id || '')) ? incoming.id : 'IIMC-' + now.toString(36).toUpperCase(),
       windowId: w.id,
+      studentEmail: email,
+      studentName: text('studentName', 120),
+      regNo: text('regNo', 40),
+      professorName: w.sections.length ? text('professorName', 120) : w.professor,
       subject: w.subject,
       courseCode: w.courseCode,
+      section,
       examType: w.examType,
       term: w.term,
-      ...(w.sections.length ? {} : { professorName: w.professor }),
+      questions: text('questions', 500),
+      reason: String(incoming.reason || '').trim().slice(0, 5000),
+      supportingDocs: (Array.isArray(incoming.supportingDocs) ? incoming.supportingDocs : []).slice(0, 20).map(n => cleanText(n, 200)).filter(Boolean),
+      paymentMethod: 'upi',
+      amountPaid: PAYMENT_AMOUNT_INR,
+      paymentVerified: false,   // the office confirms UPI payments against the bank statement
       status: 'Pending',
       createdAt: now,
       updatedMarks: null,
       professorRemarks: null,
       history: [{ at: now, event: 'Submitted', by: email, note: '' }],
     };
-    if (request.paymentMethod === 'upi') request.paymentVerified = false;
+    if (!request.studentName || !request.questions || !request.reason) {
+      sendJson(res, 400, { error: 'Name, questions and reason are required.' });
+      return;
+    }
+    if (!request.professorName) {
+      sendJson(res, 400, { error: 'No professor is assigned to this section.' });
+      return;
+    }
     if (data.requests.some(r => r.id === request.id)) request.id += '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
 
     data.requests.push(request);
@@ -530,27 +603,32 @@ async function handleRequestActions(req, res) {
       }
 
       const oldStatus = request.status;
-      request.updatedMarks = String(body.updatedMarks || '').trim() || null;
-      request.professorRemarks = String(body.professorRemarks).trim();
+      const by = cleanText(body.by, 200) || '—';
+      request.updatedMarks = cleanText(body.updatedMarks, 500) || null;
+      request.professorRemarks = String(body.professorRemarks).trim().slice(0, 5000);
       request.status = status;
+      // A refund that was only due (manual) or failed no longer applies once the marks stand
+      if (!REFUND_STATUSES.includes(status) && request.refund && !isRefundActive(request.refund)) {
+        request.refund = null;
+      }
       request.reviewedAt = Date.now();
       request.history = Array.isArray(request.history) ? request.history : [];
       request.history.push({
         at: Date.now(),
         event: oldStatus === status ? 'Remarks updated' : 'Status changed',
-        by: body.by || '—',
+        by,
         from: oldStatus,
         to: status,
         note: request.professorRemarks,
       });
       // Save the decision first so it isn't lost if the refund call is slow or fails
       saveAndArchive(data);
-      if (REFUND_STATUSES.includes(status)) await issueRefund(request, body.by);
+      if (REFUND_STATUSES.includes(status)) await issueRefund(request, by);
     }
 
     if (action === 'refund') {
       if (!REFUND_STATUSES.includes(request.status)) { sendJson(res, 409, { error: 'Marks did not change, so no refund is due.' }); return true; }
-      await issueRefund(request, body.by);
+      await issueRefund(request, cleanText(body.by, 200) || '—');
     }
 
     if (action === 'refund/refresh') {
@@ -559,6 +637,7 @@ async function handleRequestActions(req, res) {
         const before = request.refund.status;
         request.refund = refundFromRazorpay(entity, request.refund);
         if (before !== request.refund.status) {
+          request.history = Array.isArray(request.history) ? request.history : [];
           request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay', note: request.refund.id });
         }
       }
@@ -599,6 +678,7 @@ async function handleWebhook(req, res) {
       const before = request.refund.status;
       request.refund = refundFromRazorpay(entity, request.refund);
       if (before !== request.refund.status && request.refund.status !== 'pending') {
+        request.history = Array.isArray(request.history) ? request.history : [];
         request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay webhook', note: entity.id });
       }
       saveAndArchive(data);
@@ -701,27 +781,31 @@ async function handlePaymentApi(req, res) {
   return false;
 }
 
+// Only the website itself is public. Data files, the server code and config are never served.
+const PUBLIC_DIRS = ['css', 'js', 'assets'];
+
 function serveStatic(req, res) {
   let urlPath;
   try { urlPath = decodeURIComponent(req.url.split('?')[0]); }  // strip query string
   catch { res.writeHead(400); res.end('Bad Request'); return; }
   const filePath = path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath);
 
-  // Security: prevent path traversal
-  if (!filePath.startsWith(ROOT)) {
+  // Stay inside the project folder (a plain prefix check would let "../Revaluation-other" through)
+  const rel = path.relative(ROOT, filePath);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
     res.writeHead(403); res.end('Forbidden'); return;
   }
-  // Never serve dotfiles such as .env (holds the Razorpay secret)
-  if (path.relative(ROOT, filePath).split(path.sep).some(seg => seg.startsWith('.'))) {
-    res.writeHead(404); res.end('Not Found'); return;
-  }
+  const parts = rel.split(path.sep);
+  const allowed = (parts.length === 1 && parts[0] === 'index.html') ||
+    (parts.length > 1 && PUBLIC_DIRS.includes(parts[0]) && !parts.some(seg => seg.startsWith('.')));
+  if (!allowed) { res.writeHead(404); res.end('Not Found'); return; }
 
   const ext = path.extname(filePath).toLowerCase();
   const contentType = MIME_TYPES[ext] || 'application/octet-stream';
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      if (err.code === 'ENOENT') { res.writeHead(404); res.end('Not Found'); }
+      if (err.code === 'ENOENT' || err.code === 'EISDIR') { res.writeHead(404); res.end('Not Found'); }
       else { res.writeHead(500); res.end('Server Error'); }
       return;
     }
@@ -733,63 +817,41 @@ function serveStatic(req, res) {
 const server = http.createServer((req, res) => {
   // CORS headers (handy for development)
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   // ── GET /api/requests ── return all live requests
   if (req.url === '/api/requests' && req.method === 'GET') {
-    const data = readData();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(data));
+    try { sendJson(res, 200, readData()); }
+    catch (e) { sendJson(res, 500, { error: e.message }); }
     return;
   }
 
-  // ── POST /api/requests ── save live requests + update archive
+  // ── POST /api/requests ── legacy bulk save, now read-only.
+  // Requests are created through /api/requests/submit and changed through /api/requests/:id/review,
+  // which check windows, sections and who may change what. A bulk save could bypass all of that
+  // (e.g. rewrite another student's request), so it's accepted but changes nothing.
   if (req.url === '/api/requests' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body);
-        if (!Array.isArray(payload.requests)) throw new Error('requests must be an array');
-        // Merge by ID so a browser with a stale copy can't drop other people's requests,
-        // and keep server-owned review/refund fields for requests the server already has.
-        const current = readData();
-        const byId = new Map((current.requests || []).map(r => [r.id, r]));
-        for (const incoming of payload.requests) {
-          const existing = byId.get(incoming.id);
-          if (!existing) {
-            // New requests must go through /api/requests/submit (window checks); ignore them here
-            continue;
-          } else {
-            const merged = { ...existing, ...incoming };
-            // Review fields change only through /api/requests/:id/review (except when the server has none yet)
-            const serverReviewed = existing.reviewedAt || existing.refund;
-            for (const f of REVIEW_FIELDS) {
-              if (serverReviewed || f === 'refund') merged[f] = existing[f];
-            }
-            byId.set(incoming.id, merged);
-          }
-        }
-        const merged = { requests: [...byId.values()] };
-        writeData(merged);
-        archiveRequests(merged.requests);
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-    });
+    readJsonBody(req).then(payload => {
+      if (!Array.isArray(payload.requests)) throw new Error('requests must be an array');
+      sendJson(res, 200, { ok: true, ignored: payload.requests.length });
+    }).catch(e => sendJson(res, 400, { error: e.message }));
     return;
   }
 
   // ── GET /api/archive ── return immutable full archive (all snapshots ever)
   if (req.url === '/api/archive' && req.method === 'GET') {
-    const archive = readArchive();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(archive));
+    try { sendJson(res, 200, readArchive()); }
+    catch (e) { sendJson(res, 500, { error: e.message }); }
+    return;
+  }
+
+  // ── Faculty added by the office ──
+  if (req.url.startsWith('/api/faculty')) {
+    handleFaculty(req, res).then(handled => {
+      if (!handled) sendJson(res, 404, { error: 'Not Found' });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
@@ -797,13 +859,13 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith('/api/windows')) {
     handleWindows(req, res).then(handled => {
       if (!handled) sendJson(res, 404, { error: 'Not Found' });
-    });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
   // ── New request (window-checked) ──
   if (req.url === '/api/requests/submit' && req.method === 'POST') {
-    handleSubmitRequest(req, res);
+    handleSubmitRequest(req, res).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
@@ -811,13 +873,13 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith('/api/requests/')) {
     handleRequestActions(req, res).then(handled => {
       if (!handled) sendJson(res, 404, { error: 'Not Found' });
-    });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
   // ── Razorpay webhook ──
   if (req.url === '/api/razorpay/webhook' && req.method === 'POST') {
-    handleWebhook(req, res).catch(e => sendJson(res, 500, { error: e.message }));
+    handleWebhook(req, res).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
@@ -825,7 +887,7 @@ const server = http.createServer((req, res) => {
   if (req.url.startsWith('/api/payment/')) {
     handlePaymentApi(req, res).then(handled => {
       if (!handled) sendJson(res, 404, { error: 'Not Found' });
-    });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
