@@ -1,0 +1,19 @@
+{
+  "windows": [
+    {
+      "id": "WIN-MUB2SBAH-89FB",
+      "subject": "Strategic Management",
+      "courseCode": "FIN-110",
+      "examType": "Case prep",
+      "sections": [
+        "A"
+      ],
+      "term": "3",
+      "startsAt": 1789984560000,
+      "endsAt": 1790070960000,
+      "closedAt": null,
+      "createdBy": "mbaoffice@email.iimcal.ac.in",
+      "createdAt": 1789984888363
+    }
+  ]
+}

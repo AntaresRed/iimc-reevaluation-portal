@@ -1433,3 +1433,162 @@ body.theme-sage .file-upload-area.has-file {
   line-height: 1.5;
   margin-top: 8px;
 }
+
+/* ===== RE-EVALUATION WINDOWS ===== */
+.open-windows {
+  background: var(--bg-card);
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 18px 20px;
+  margin-bottom: 24px;
+}
+.open-windows-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.open-windows-head h3 { font-family: 'Cormorant Garamond', serif; font-size: 24px; color: var(--iim-brown); }
+.open-windows-head span { font-size: 12px; color: var(--text-muted); }
+.win-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+.win-card {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--success);
+  border-radius: var(--radius-md);
+  background: var(--iim-cream);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.win-card-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+.win-card-title, .win-summary-title { font-size: 15px; font-weight: 700; color: var(--text-primary); }
+.win-code {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 1px 6px;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+.win-meta { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--text-secondary); }
+.win-card-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: auto; }
+.win-countdown { font-size: 13px; font-weight: 700; color: var(--iim-brown); }
+.win-card-foot .btn-secondary:disabled { opacity: 0.7; cursor: default; color: var(--success); border-color: rgba(42,122,59,0.3); }
+.win-empty { font-size: 14px; color: var(--text-muted); padding: 8px 0; }
+.win-upcoming { margin-top: 12px; font-size: 12px; color: var(--text-secondary); display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.win-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 3px 9px;
+  border-radius: 999px;
+  white-space: nowrap;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+}
+.win-badge-open { background: var(--success-bg); color: var(--success); border-color: rgba(42,122,59,0.3); }
+.win-badge-scheduled { background: var(--info-bg); color: var(--info); border-color: rgba(26,95,168,0.3); }
+
+/* Request form: the exam this request belongs to */
+.form-window-summary {
+  background: var(--iim-cream);
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#f-prof[readonly] { color: var(--text-secondary); cursor: default; }
+
+/* Professor: compact strip */
+.prof-open-windows { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
+.prof-win-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  background: var(--bg-card);
+  border: 1px solid rgba(42,122,59,0.3);
+  border-left: 4px solid var(--success);
+  border-radius: var(--radius-md);
+  padding: 10px 14px;
+  font-size: 13px;
+}
+.prof-win-title { font-weight: 700; color: var(--text-primary); }
+.prof-win-meta { color: var(--text-secondary); }
+
+/* Admin */
+.win-admin-card { cursor: pointer; }
+.win-times { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; font-size: 13px; }
+.win-times label { display: block; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+.win-admin-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12px; color: var(--text-secondary); border-top: 1px solid var(--border); padding-top: 10px; }
+.btn-end { padding: 6px 12px; font-size: 12px; }
+.section-picker { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.section-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.section-chip.disabled { opacity: 0.45; cursor: not-allowed; }
+.section-chip input { width: auto; }
+.btn-select-all { padding: 6px 12px; font-size: 12px; }
+.section-picker-hint { font-size: 12px; color: var(--text-muted); }
+#w-examtype-custom { margin-top: 8px; }
+
+/* Window cards open a details popup */
+.win-card, .prof-win-row { cursor: pointer; transition: box-shadow 0.2s, transform 0.2s; }
+.win-card:hover, .prof-win-row:hover { box-shadow: var(--shadow-card); transform: translateY(-1px); }
+.win-upcoming-item { cursor: pointer; text-decoration: underline dotted; }
+.win-upcoming-item:hover { color: var(--iim-brown); }
+.win-admin-actions { display: inline-flex; gap: 8px; }
+.wd-profs { display: flex; flex-direction: column; gap: 8px; }
+.wd-prof-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  background: var(--iim-cream);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 14px;
+}
+.wd-prof-name { font-weight: 700; color: var(--text-primary); }
+.wd-prof-secs { font-size: 12px; color: var(--text-secondary); }
+#wd-sub .win-badge { margin-right: 6px; }
+
+/* Window form */
+.label-optional { font-weight: 400; text-transform: none; letter-spacing: 0; color: var(--text-muted); }
+.form-group label.checkbox-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.checkbox-inline input { width: auto; }
+#w-subject-custom { margin-top: 8px; }
+.form-group input:disabled, .form-group select:disabled { opacity: 0.6; cursor: not-allowed; }
+.window-lock-note {
+  font-size: 13px;
+  background: var(--warning-bg);
+  border: 1px solid rgba(154,108,16,0.25);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 10px 12px;
+}

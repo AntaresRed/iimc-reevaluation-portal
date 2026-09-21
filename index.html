@@ -26,7 +26,7 @@
     href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap"
     rel="stylesheet" />
   <link rel="icon" type="image/png" href="assets/browser_logo.png" />
-  <link rel="stylesheet" href="css/style.css?v=3" />
+  <link rel="stylesheet" href="css/style.css?v=5" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script src="js/vendor/qrcode.min.js"></script>
 </head>
@@ -65,7 +65,7 @@
           <p class="login-domain-note">Only <strong>@email.iimcal.ac.in</strong> accounts are permitted</p>
 
           <div class="google-signin-wrapper">
-            <p class="signin-hint">Your role (Student / Faculty) is automatically detected from your Google account.</p>
+            <p class="signin-hint">Your role (Student / Faculty / Admin) is automatically detected from your Google account.</p>
             <div id="google-signin-btn"></div>
             <div class="input-error" id="google-auth-error"></div>
           </div>
@@ -78,6 +78,17 @@
             <div class="creds-list" id="creds-list" style="display:none">
               <p class="creds-note-dev">⚠️ Bypasses Google OAuth — remove before production</p>
               <div id="creds-entries"></div>
+            </div>
+          </div>
+
+          <!-- DEV-ONLY: Admin quick-login bypass -->
+          <div class="creds-panel">
+            <button class="creds-toggle" onclick="toggleCreds(this)">
+              🛠️ [DEV] Admin Test Login <span class="creds-arrow">▼</span>
+            </button>
+            <div class="creds-list" style="display:none">
+              <p class="creds-note-dev">⚠️ Dummy admin accounts — remove before production</p>
+              <div id="admin-creds-entries"></div>
             </div>
           </div>
 
@@ -111,10 +122,10 @@
           <h2 class="dashboard-title">Student Dashboard</h2>
           <p class="dashboard-subtitle" id="student-welcome"></p>
         </div>
-        <button class="btn-primary" onclick="showStudentForm()">
-          <span>+</span> New Re-Evaluation Request
-        </button>
       </div>
+
+      <!-- Open re-evaluation windows: the only way to raise a request -->
+      <section class="open-windows" id="student-open-windows"></section>
 
       <!-- Stats -->
       <div class="stats-row" id="student-stats"></div>
@@ -141,12 +152,14 @@
         <div class="modal-header">
           <div>
             <h3>New Re-Evaluation Request</h3>
-            <p class="modal-sub">Fill all fields carefully. Incomplete forms will not be accepted.</p>
+            <p class="modal-sub">Window closes in <strong id="form-countdown">—</strong></p>
           </div>
           <button class="modal-close" onclick="closeModal('student-form-modal')">✕</button>
         </div>
         <div class="modal-body">
           <form id="reval-form" onsubmit="submitRevalForm(event)">
+            <!-- The exam this request is for, fixed by the open window -->
+            <div class="form-window-summary" id="form-window-summary"></div>
             <div class="form-grid-2">
               <div class="form-group">
                 <label>Full Name *</label>
@@ -158,36 +171,16 @@
               </div>
             </div>
             <div class="form-grid-2">
-              <div class="form-group">
-                <label>Subject / Course *</label>
-                <select id="f-subject" required onchange="onSubjectChange()">
-                  <option value="">Select subject</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label>Professor Name *</label>
-                <select id="f-prof" required onchange="onProfChange()">
-                  <option value="">Select subject first</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-grid-2">
-              <div class="form-group">
+              <div class="form-group" id="f-section-group">
                 <label>Section *</label>
-                <select id="f-section" required>
-                  <option value="">Select professor first</option>
+                <select id="f-section" required onchange="onSectionChange()">
+                  <option value="">Select section</option>
                 </select>
               </div>
               <div class="form-group">
-                <label>Exam Type *</label>
-                <select id="f-examtype" required>
-                  <option value="">Select subject first</option>
-                </select>
+                <label>Professor</label>
+                <input type="text" id="f-prof" readonly placeholder="Filled in from your section" />
               </div>
-            </div>
-            <div class="form-group">
-              <label>Academic Year / Term *</label>
-              <input type="text" id="f-term" placeholder="e.g. Term 3, 2024-25" required />
             </div>
             <div class="form-group">
               <label>Questions to be Re-Evaluated *</label>
@@ -239,7 +232,7 @@
             </div>
             <div class="deadline-notice">
               <span>⚠️</span>
-              <span>Re-evaluation requests must be submitted within <strong>24 hours</strong> of result declaration.
+              <span>Requests can only be submitted while the re-evaluation window is open.
                 Ensure payment of the ₹10 re-evaluation fee before submission.</span>
             </div>
             <div class="form-actions">
@@ -286,6 +279,9 @@
         </div>
         <div class="prof-badge">Professor View</div>
       </div>
+
+      <!-- Re-evaluation windows currently open for this professor's subjects/sections -->
+      <section class="prof-open-windows" id="prof-open-windows"></section>
 
       <!-- Stats -->
       <div class="stats-row" id="prof-stats"></div>
@@ -351,10 +347,132 @@
     </div>
   </div>
 
+  <!-- ========== ADMIN DASHBOARD ========== -->
+  <div id="page-admin" class="page">
+    <nav class="navbar">
+      <div class="nav-brand">
+        <div class="nav-logo">IIM<span>C</span></div>
+        <span class="nav-title">Admin Portal</span>
+      </div>
+      <div class="nav-right">
+        <div class="nav-user" id="admin-nav-user"></div>
+        <button class="btn-signout" onclick="signOut()">Sign Out</button>
+      </div>
+    </nav>
+
+    <div class="dashboard-container">
+      <div class="dashboard-header">
+        <div>
+          <h2 class="dashboard-title">Re-Evaluation Windows</h2>
+          <p class="dashboard-subtitle">Students can only apply for re-evaluation while a window is open for their exam and section.</p>
+        </div>
+        <button class="btn-primary" onclick="showWindowForm()">
+          <span>+</span> Open Re-evaluation Window
+        </button>
+      </div>
+
+      <div class="stats-row" id="admin-stats"></div>
+
+      <div class="tab-bar">
+        <button class="tab active" onclick="switchAdminTab('open', this)">Open</button>
+        <button class="tab" onclick="switchAdminTab('scheduled', this)">Scheduled</button>
+        <button class="tab" onclick="switchAdminTab('closed', this)">Closed</button>
+        <button class="tab" onclick="switchAdminTab('all', this)">All</button>
+      </div>
+
+      <div class="requests-grid" id="admin-windows-grid"></div>
+    </div>
+
+    <!-- Open Window Modal -->
+    <div id="window-form-modal" class="modal-overlay">
+      <div class="modal-box modal-wide">
+        <div class="modal-header">
+          <div>
+            <h3 id="window-form-title">Open Re-evaluation Window</h3>
+            <p class="modal-sub">Students in the chosen sections can apply until the window closes.</p>
+          </div>
+          <button class="modal-close" onclick="closeModal('window-form-modal')">✕</button>
+        </div>
+        <div class="modal-body">
+          <form id="window-form" onsubmit="submitWindowForm(event)">
+            <div class="window-lock-note" id="w-lock-note" style="display:none"></div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Subject *</label>
+                <select id="w-subject" required onchange="onWindowSubjectChange()">
+                  <option value="">Select subject</option>
+                </select>
+                <input type="text" id="w-subject-custom" maxlength="120" placeholder="Subject name" style="display:none" />
+              </div>
+              <div class="form-group">
+                <label>Course Code</label>
+                <input type="text" id="w-code" maxlength="40" placeholder="e.g. MBA-MG-201" />
+              </div>
+            </div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Type of Exam *</label>
+                <select id="w-examtype" required onchange="onWindowExamTypeChange()"></select>
+                <input type="text" id="w-examtype-custom" maxlength="40" placeholder="Name of the exam type, e.g. Assignment" style="display:none" />
+              </div>
+              <div class="form-group">
+                <label>Term *</label>
+                <input type="text" id="w-term" maxlength="60" required placeholder="e.g. Term 2, 2025-26" />
+              </div>
+            </div>
+            <div class="form-group">
+              <label>Sections <span class="label-optional">(optional)</span></label>
+              <div class="section-picker" id="w-sections" onchange="onWindowSectionsChange()"></div>
+              <div class="section-picker-hint" id="w-sections-hint">Select a subject to see its sections.</div>
+            </div>
+            <div class="form-group" id="w-prof-group" style="display:none">
+              <label>Reviewing Professor *</label>
+              <select id="w-prof"></select>
+              <div class="section-picker-hint">No section is selected, so every student of this subject can apply and all requests go to this professor.</div>
+            </div>
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label>Opens At *</label>
+                <input type="datetime-local" id="w-start" required onchange="onWindowStartChange()" />
+              </div>
+              <div class="form-group">
+                <label>Closes At *</label>
+                <input type="datetime-local" id="w-end" required onchange="updateWindowLength()" />
+                <label class="checkbox-inline">
+                  <input type="checkbox" id="w-24h" checked onchange="onWindow24hChange()" />
+                  24-hour window (closes 24 hours after it opens)
+                </label>
+              </div>
+            </div>
+            <div class="section-picker-hint" id="w-length">Window length: 24 hours</div>
+            <div class="form-actions">
+              <button type="button" class="btn-secondary" onclick="closeModal('window-form-modal')">Cancel</button>
+              <button type="submit" class="btn-primary" id="window-form-submit">Open Window</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Re-evaluation window details (opened from any window card) -->
+  <div id="window-detail-modal" class="modal-overlay">
+    <div class="modal-box modal-wide">
+      <div class="modal-header">
+        <div>
+          <h3 id="wd-title"></h3>
+          <p class="modal-sub" id="wd-sub"></p>
+        </div>
+        <button class="modal-close" onclick="closeModal('window-detail-modal')">✕</button>
+      </div>
+      <div class="modal-body" id="wd-body"></div>
+    </div>
+  </div>
+
   <!-- Toast -->
   <div id="toast" class="toast"></div>
 
-  <script src="js/app.js?v=3"></script>
+  <script src="js/app.js?v=5"></script>
 </body>
 
 </html>

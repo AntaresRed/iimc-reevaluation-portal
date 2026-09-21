@@ -121,6 +121,27 @@ function saveRequests(requests) {
   }
 }
 
+// Create a new request. The server checks the window is open, the section belongs to it,
+// and the student hasn't already applied; offline, it's just stored locally.
+async function submitNewRequest(request) {
+  if (_serverMode) {
+    const res = await fetch('/api/requests/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Submission failed');
+    _cache.push(data.request);
+    localStorage.setItem('reval_requests', JSON.stringify(_cache));
+    return data.request;
+  }
+  const requests = getRequests();
+  requests.push(request);
+  saveRequests(requests);
+  return request;
+}
+
 // Called once on page load — try server first, fall back to localStorage
 async function loadInitialData() {
   try {
@@ -413,78 +434,19 @@ function renderHistoryTimeline(r) {
     </div>`;
 }
 
-// ===== CASCADING FORM DROPDOWN LOGIC =====
-function populateSubjectDropdown() {
-  const sel = document.getElementById('f-subject');
-  sel.innerHTML = '<option value="">Select subject</option>';
-  getUniqueSubjects().forEach(s => {
-    const opt = document.createElement('option');
-    opt.value = s; opt.textContent = s;
-    sel.appendChild(opt);
-  });
+// ===== REQUEST FORM (tied to an open window) =====
+// Subject, exam type and term come from the window; the student only picks their section,
+// and the professor follows from the subject + section mapping.
+let _formWindow = null;
+
+function professorFor(subject, section) {
+  const entry = PROF_MAP.find(e => e.subject === subject && e.sections.includes(section));
+  return entry ? entry.professor : '';
 }
 
-function onSubjectChange() {
-  const subject = document.getElementById('f-subject').value;
-  const profSel = document.getElementById('f-prof');
-  const examSel = document.getElementById('f-examtype');
-  const secSel = document.getElementById('f-section');
-
-  // Reset downstream
-  profSel.innerHTML = '<option value="">Select professor</option>';
-  secSel.innerHTML = '<option value="">Select professor first</option>';
-  examSel.innerHTML = '<option value="">Select subject first</option>';
-
-  if (!subject) return;
-
-  // Populate professors for this subject
-  const entries = getEntriesForSubject(subject);
-  const seenProfs = new Set();
-  entries.forEach(e => {
-    if (!seenProfs.has(e.professor)) {
-      seenProfs.add(e.professor);
-      const opt = document.createElement('option');
-      opt.value = e.professor; opt.textContent = e.professor;
-      profSel.appendChild(opt);
-    }
-  });
-
-  // Populate exam types based on term coverage
-  const coverage = getTermCoverageForSubject(subject);
-  if (coverage === 'PostMid') {
-    examSel.innerHTML = '<option value="End Term">End Term</option>';
-  } else {
-    examSel.innerHTML = '<option value="">Select exam type</option><option value="Mid Term">Mid Term</option><option value="End Term">End Term</option>';
-  }
-
-  // If reg number is already filled, auto-fill professor + section
-  const regNo = document.getElementById('f-regno').value.trim();
-  const section = getSectionFromRegNo(regNo);
-  if (section) autoFillFromSectionAndSubject(section, subject);
-}
-
-function onProfChange() {
-  const subject = document.getElementById('f-subject').value;
-  const prof = document.getElementById('f-prof').value;
-  const secSel = document.getElementById('f-section');
-
-  secSel.innerHTML = '<option value="">Select section</option>';
-  if (!prof || !subject) return;
-
-  // Find the specific entry for this prof + subject combination
-  const entry = PROF_MAP.find(e => e.professor === prof && e.subject === subject);
-  if (!entry) return;
-
-  entry.sections.forEach(s => {
-    const opt = document.createElement('option');
-    opt.value = s; opt.textContent = 'Section ' + s;
-    secSel.appendChild(opt);
-  });
-
-  // Auto-select if only one section
-  if (entry.sections.length === 1) {
-    secSel.value = entry.sections[0];
-  }
+function onSectionChange() {
+  const section = document.getElementById('f-section').value;
+  document.getElementById('f-prof').value = _formWindow && section ? professorFor(_formWindow.subject, section) : '';
 }
 
 // ===== REGISTRATION NUMBER AUTO-FILL =====
@@ -509,46 +471,26 @@ function getSectionFromRegNo(regNo) {
 function onRegNoChange() {
   const regNo = document.getElementById('f-regno').value.trim();
   const section = getSectionFromRegNo(regNo);
-  const subject = document.getElementById('f-subject').value;
 
-  // Remove any previous hint
   const existing = document.getElementById('regno-hint');
   if (existing) existing.remove();
-
   if (!section) return;
 
-  // Show a subtle inline hint
+  // Pick the section automatically when it's part of this window; warn when it isn't
+  const allowed = !_formWindow || !_formWindow.sections.length || _formWindow.sections.includes(section);
   const hintEl = document.createElement('div');
   hintEl.id = 'regno-hint';
-  hintEl.style.cssText = 'font-size:12px; color:#C9A84C; margin-top:4px;';
-  hintEl.textContent = `🏷️ Detected: Section ${section}`;
+  hintEl.style.cssText = 'font-size:12px; margin-top:4px; color:' + (allowed ? '#C9A84C' : '#b83232') + ';';
+  hintEl.textContent = allowed
+    ? `🏷️ Detected: Section ${section}`
+    : `⚠️ Section ${section} is not part of this re-evaluation window.`;
   document.getElementById('f-regno').parentNode.appendChild(hintEl);
 
-  // If subject is already selected, auto-fill professor and section
-  if (subject) {
-    autoFillFromSectionAndSubject(section, subject);
+  if (allowed && _formWindow && _formWindow.sections.length) {
+    document.getElementById('f-section').value = section;
+    onSectionChange();
   }
 }
-
-function autoFillFromSectionAndSubject(section, subject) {
-  const profSel = document.getElementById('f-prof');
-  const secSel = document.getElementById('f-section');
-
-  // Find the mapping entry for this subject + section
-  const entry = PROF_MAP.find(e => e.subject === subject && e.sections.includes(section));
-  if (!entry) return;
-
-  // Set professor dropdown (make sure the option exists)
-  const profOption = Array.from(profSel.options).find(o => o.value === entry.professor);
-  if (profOption) {
-    profSel.value = entry.professor;
-    // Trigger section population
-    onProfChange();
-    // Then set the section
-    secSel.value = section;
-  }
-}
-
 
 // ===== GOOGLE SIGN-IN =====
 const IIMC_DOMAIN = 'email.iimcal.ac.in';
@@ -598,21 +540,14 @@ function handleGoogleCredential(response) {
     }
 
     // ── Auto-detect role ──
-    const role = EMAIL_TO_PROF[email] ? 'professor' : 'student';
+    const role = ADMIN_EMAILS.includes(email) ? 'admin' : EMAIL_TO_PROF[email] ? 'professor' : 'student';
 
     currentUser = { email, name, role, picture };
     localStorage.setItem('reval_session', JSON.stringify(currentUser));
     localStorage.setItem('reval_last_email', email);
 
-    if (role === 'student') {
-      showPage('page-student');
-      applyUserTheme();
-      initStudentDashboard();
-    } else {
-      showPage('page-professor');
-      applyUserTheme();
-      initProfDashboard();
-    }
+    applyUserTheme();
+    openDashboardForRole();
   } catch (err) {
     if (errorEl) errorEl.textContent = 'Sign-in failed. Please try again.';
     console.error('[Google Auth] Error:', err);
@@ -679,7 +614,7 @@ function initStudentDashboard() {
     : label;
   document.getElementById('student-welcome').textContent =
     'Welcome back, ' + currentUser.name + '! Manage your re-evaluation requests below.';
-  populateSubjectDropdown();
+  renderStudentOpenWindows();
   renderStudentStats();
   renderStudentRequests(currentStudentTab);
 }
@@ -825,16 +760,24 @@ function openStudentDetail(id) {
 }
 
 // ===== STUDENT FORM =====
-function showStudentForm() {
+// Opens the request form for one open window. Returns false if the student can't apply.
+function showStudentForm(windowId) {
+  const w = getWindows().find(x => x.id === windowId);
+  if (!w || windowStateOf(w) !== 'open') { showToast('This re-evaluation window is not open.', 'error'); return false; }
+  if (hasAppliedInWindow(w.id)) { showToast('You have already applied in this window.', 'info'); return false; }
+  _formWindow = w;
+
   document.getElementById('reval-form').reset();
-  // Re-seed subject dropdown after reset
-  populateSubjectDropdown();
-  // Reset cascading selects
-  ['f-prof', 'f-section'].forEach(id => {
-    const el = document.getElementById(id);
-    if (el) el.innerHTML = '<option value="">Select subject first</option>';
-  });
-  document.getElementById('f-examtype').innerHTML = '<option value="">Select subject first</option>';
+  document.getElementById('form-window-summary').innerHTML = windowSummaryHtml(w);
+  const sectioned = w.sections.length > 0;
+  document.getElementById('f-section-group').style.display = sectioned ? '' : 'none';
+  const secSel = document.getElementById('f-section');
+  secSel.required = sectioned;
+  secSel.innerHTML = '<option value="">Select section</option>' +
+    w.sections.map(sec => `<option value="${sec}">Section ${sec}</option>`).join('');
+  document.getElementById('f-prof').value = sectioned ? '' : (w.professor || '');
+  const hint = document.getElementById('regno-hint');
+  if (hint) hint.remove();
   document.getElementById('docs-upload-content').innerHTML = `
     <span class="file-upload-icon">🗂️</span>
     <p>Upload answer scripts, screenshots or any supporting evidence</p>
@@ -842,6 +785,7 @@ function showStudentForm() {
   document.getElementById('docs-upload-area').classList.remove('has-file');
   resetPaymentSection();
   openModal('student-form-modal');
+  return true;
 }
 
 function handleDocsUpload(input) {
@@ -860,76 +804,72 @@ function handleDocsUpload(input) {
 
 async function submitRevalForm(e) {
   e.preventDefault();
-  const payment = await getPaymentForSubmission();
-  if (!payment.ok) return;
-  const section = document.getElementById('f-section').value;
-  if (!section) { showToast('Please select your section.', 'error'); return; }
+  const w = _formWindow;
+  if (!w || windowStateOf(w) !== 'open') { showToast('This re-evaluation window has closed.', 'error'); return; }
 
-  // ── Upload files to Cloudinary if configured ──
-  const submitBtn = document.querySelector('#reval-form .btn-primary');
-  const originalLabel = submitBtn.textContent;
-  submitBtn.disabled = true;
-
-  let paymentUrl = null;
-  let supportingDocUrls = [], supportingDocNames = [];
-
-  try {
-    if (CLOUDINARY_ENABLED) {
-
-      const docFiles = Array.from(document.getElementById('f-docs').files || []);
-      for (let i = 0; i < docFiles.length; i++) {
-        submitBtn.textContent = `Uploading docs (${i + 1}/${docFiles.length})...`;
-        supportingDocUrls.push(await uploadToCloudinary(docFiles[i]));
-        supportingDocNames.push(docFiles[i].name);
-      }
-    } else {
-      // Cloudinary not configured — store filenames only
-      supportingDocNames = Array.from(document.getElementById('f-docs').files || []).map(f => f.name);
-    }
-  } catch (err) {
-    submitBtn.disabled = false;
-    submitBtn.textContent = originalLabel;
-    showToast('File upload failed: ' + err.message, 'error');
+  // Windows without sections cover every student of the subject and name their professor
+  const sectioned = w.sections.length > 0;
+  const regSection = getSectionFromRegNo(document.getElementById('f-regno').value.trim());
+  const section = sectioned ? document.getElementById('f-section').value : (regSection || '');
+  if (sectioned && (!section || !w.sections.includes(section))) { showToast('Please select one of the sections in this window.', 'error'); return; }
+  if (sectioned && regSection && regSection !== section) {
+    showToast(`Your registration number is in Section ${regSection}, not Section ${section}.`, 'error');
+    return;
+  }
+  const professorName = sectioned ? professorFor(w.subject, section) : w.professor;
+  if (!professorName) {
+    showToast(sectioned ? `No professor is mapped to ${w.subject} for Section ${section}.` : 'This window has no reviewing professor.', 'error');
     return;
   }
 
-  submitBtn.textContent = 'Saving...';
+  const payment = await getPaymentForSubmission();
+  if (!payment.ok) return;
 
+  const submitBtn = document.querySelector('#reval-form button[type="submit"]');
+  const originalLabel = submitBtn.textContent;
+  submitBtn.disabled = true;
+  submitBtn.textContent = 'Submitting...';
+
+  const now = Date.now();
   const request = {
     id: generateId(),
+    windowId: w.id,
     studentEmail: currentUser.email,
     studentName: document.getElementById('f-name').value.trim(),
     regNo: document.getElementById('f-regno').value.trim(),
-    professorName: document.getElementById('f-prof').value,
-    subject: document.getElementById('f-subject').value,
-    section: section,
-    examType: document.getElementById('f-examtype').value,
-    term: document.getElementById('f-term').value.trim(),
+    professorName,
+    subject: w.subject,
+    courseCode: w.courseCode || '',
+    section,
+    examType: w.examType,
+    term: w.term,
     questions: document.getElementById('f-questions').value.trim(),
     reason: document.getElementById('f-reason').value.trim(),
+    supportingDocs: Array.from(document.getElementById('f-docs').files || []).map(f => f.name),
     ...payment.fields,
-    paymentUrl,                      // null if Cloudinary not configured
-    supportingDocs: supportingDocNames,
-    supportingDocUrls,               // [] if Cloudinary not configured
     status: 'Pending',
-    createdAt: Date.now(),
+    createdAt: now,
     updatedMarks: null,
     professorRemarks: null,
-    history: [
-      { at: Date.now(), event: 'Submitted', by: currentUser.email, note: '' }
-    ],
+    history: [{ at: now, event: 'Submitted', by: currentUser.email, note: '' }],
   };
 
-  const requests = getRequests();
-  requests.push(request);
-  saveRequests(requests);
+  try {
+    await submitNewRequest(request);
+  } catch (err) {
+    showToast('Could not submit: ' + err.message, 'error');
+    return;
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.textContent = originalLabel;
+  }
 
-  submitBtn.disabled = false;
-  submitBtn.textContent = originalLabel;
+  stopFormCountdown();
   closeModal('student-form-modal');
   renderStudentStats();
+  renderStudentOpenWindows();
   switchStudentTab('pending', document.querySelector('#page-student .tab'));
-  showToast(`Request ${request.id} submitted successfully!`, 'success');
+  jokaToast('submit', section);
 }
 
 // ===== PROFESSOR DASHBOARD =====
@@ -952,6 +892,7 @@ function initProfDashboard() {
   document.getElementById('prof-welcome').textContent =
     `Welcome, ${currentUser.name}. Review re-evaluation requests assigned to you.${subtitleExtra}`;
 
+  renderProfOpenWindows();
   renderProfStats();
   renderProfRequests(currentProfTab);
 }
@@ -1224,19 +1165,14 @@ function showToast(msg, type = 'info') {
 window.addEventListener('DOMContentLoaded', async () => {
   // Load data from server (or localStorage fallback) before rendering anything
   await loadInitialData();
+  await loadWindows();
   await loadPaymentConfig();
 
   const session = localStorage.getItem('reval_session');
   if (session) {
     try {
       currentUser = JSON.parse(session);
-      if (currentUser.role === 'student') {
-        showPage('page-student');
-        initStudentDashboard();
-      } else {
-        showPage('page-professor');
-        initProfDashboard();
-      }
+      openDashboardForRole();
     } catch { showPage('page-login'); }
   } else {
     showPage('page-login');
@@ -1247,12 +1183,633 @@ window.addEventListener('DOMContentLoaded', async () => {
     initGoogleSignIn();
   }
 
-  // Populate dev faculty login panel
+  // Populate dev login panels
   populateCreds();
+  populateAdminCreds();
 });
 
 // Called by GIS library once it finishes loading (handles the async defer case)
 window.onGoogleLibraryLoad = initGoogleSignIn;
+
+// ===== RE-EVALUATION WINDOWS =====
+// Admins open a window for a subject + exam + term, optionally limited to sections, with opening and
+// closing times (24 hours by default). Students can only raise requests while a window is open.
+// A window with no sections covers every student of the subject and names its reviewing professor.
+const ADMIN_ACCOUNTS = [
+  { name: 'MBA Office', email: 'mbaoffice@email.iimcal.ac.in' },
+  { name: 'Exam Cell', email: 'examcell@email.iimcal.ac.in' },
+];
+const ADMIN_EMAILS = ADMIN_ACCOUNTS.map(a => a.email);
+const DEFAULT_EXAM_TYPES = ['Quiz', 'Mid Term', 'End Term'];
+const ALL_SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F'];
+const WINDOW_LENGTH_MS = 24 * 60 * 60 * 1000;
+const OTHER_OPTION = '__other';
+
+let _windows = [];
+let currentAdminTab = 'open';
+let _editingWindowId = null;   // set while the window form edits an existing window
+
+function getWindows() { return _windows; }
+
+// Server first, localStorage when offline (same pattern as requests)
+async function loadWindows() {
+  if (_serverMode) {
+    try {
+      const res = await fetch('/api/windows', { signal: AbortSignal.timeout(1500) });
+      if (res.ok) {
+        _windows = (await res.json()).windows || [];
+        localStorage.setItem('reval_windows', JSON.stringify(_windows));
+        return;
+      }
+    } catch { /* fall through to the local copy */ }
+  }
+  try { _windows = JSON.parse(localStorage.getItem('reval_windows') || '[]'); } catch { _windows = []; }
+}
+
+function saveWindowsLocally() {
+  localStorage.setItem('reval_windows', JSON.stringify(_windows));
+}
+
+function windowEnd(w) {
+  return w.closedAt ? Math.min(w.closedAt, w.endsAt) : w.endsAt;
+}
+
+// scheduled → open → closed (closed early when an admin ends it)
+function windowStateOf(w, now = Date.now()) {
+  if (w.closedAt && w.closedAt <= now) return 'closed';
+  if (now < w.startsAt) return 'scheduled';
+  if (now >= w.endsAt) return 'closed';
+  return 'open';
+}
+
+function formatTimeLeft(ms) {
+  if (ms <= 0) return '0m';
+  const d = Math.floor(ms / 86400000);
+  const h = Math.floor((ms % 86400000) / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  if (d) return `${d}d ${h}h`;
+  if (h) return `${h}h ${m}m`;
+  return `${Math.max(m, 1)}m`;
+}
+
+function windowTitle(w) {
+  return escapeHtml(w.subject) + (w.courseCode ? ` <span class="win-code">${escapeHtml(w.courseCode)}</span>` : '');
+}
+
+function sectionsLabel(w) {
+  return w.sections && w.sections.length ? 'Sections ' + w.sections.join(', ') : 'All students (no sections)';
+}
+
+// Who reviews requests in this window: one professor per section, or the professor the admin named
+function windowProfessors(w) {
+  if (!w.sections || !w.sections.length) return [{ section: '', professor: w.professor || 'Not assigned' }];
+  return w.sections.map(sec => ({ section: sec, professor: professorFor(w.subject, sec) || 'Not assigned' }));
+}
+
+function windowSummaryHtml(w) {
+  return `<div class="win-summary-title">${windowTitle(w)}</div>
+    <div class="win-meta">
+      <span>📝 ${escapeHtml(w.examType)}</span>
+      <span>📅 ${escapeHtml(w.term)}</span>
+      <span>🏷️ ${sectionsLabel(w)}</span>
+      <span>⏳ Closes ${formatDateTime(windowEnd(w))}</span>
+    </div>`;
+}
+
+function requestsInWindow(id) {
+  return getRequests().filter(r => r.windowId === id);
+}
+
+function hasAppliedInWindow(id) {
+  return getRequests().some(r => r.windowId === id && r.studentEmail === currentUser.email);
+}
+
+// ----- Window details: opened by clicking any window card, for every role -----
+function openWindowDetail(id) {
+  const w = getWindows().find(x => x.id === id);
+  if (!w) return;
+  const now = Date.now();
+  const state = windowStateOf(w, now);
+  const role = currentUser && currentUser.role;
+  const endedEarly = w.closedAt && w.closedAt < w.endsAt;
+  const badge = { open: '● Open', scheduled: 'Scheduled', closed: endedEarly ? 'Ended early' : 'Closed' }[state];
+  const timing = state === 'open' ? `closes in ${formatTimeLeft(windowEnd(w) - now)}`
+    : state === 'scheduled' ? `opens in ${formatTimeLeft(w.startsAt - now)}`
+    : `closed ${formatDateTime(windowEnd(w))}`;
+
+  // "Prof. X — Sections B, C": group sections under each professor
+  const byProf = new Map();
+  windowProfessors(w).forEach(({ section, professor }) => {
+    if (!byProf.has(professor)) byProf.set(professor, []);
+    if (section) byProf.get(professor).push(section);
+  });
+  const profRows = [...byProf].map(([prof, secs]) => `
+    <div class="wd-prof-row">
+      <span class="wd-prof-name">👨‍🏫 ${escapeHtml(prof)}</span>
+      <span class="wd-prof-secs">${secs.length ? (secs.length > 1 ? 'Sections ' : 'Section ') + secs.join(', ') : 'All students'}</span>
+    </div>`).join('');
+
+  const rows = [
+    ['Course Code', w.courseCode ? escapeHtml(w.courseCode) : '—'],
+    ['Type of Exam', escapeHtml(w.examType)],
+    ['Term', escapeHtml(w.term)],
+    ['Sections', w.sections.length ? w.sections.join(', ') : 'None — open to every student of the subject'],
+    ['Opens', formatDateTime(w.startsAt)],
+    ['Closes', formatDateTime(windowEnd(w))],
+  ];
+  if (role === 'admin') {
+    rows.push(['Requests Received', String(requestsInWindow(w.id).length)]);
+    rows.push(['Opened By', escapeHtml(w.createdBy || '—')]);
+  } else if (role === 'professor') {
+    const mine = requestsInWindow(w.id).filter(r => r.professorName === resolveProfessorName(currentUser.email)).length;
+    rows.push(['Your Requests', String(mine)]);
+  }
+
+  let actions = '';
+  if (role === 'student' && state === 'open') {
+    actions = hasAppliedInWindow(w.id)
+      ? '<button class="btn-secondary" disabled>✓ Applied</button>'
+      : `<button class="btn-primary" onclick="closeModal('window-detail-modal'); showStudentForm('${w.id}')">Apply for Re-evaluation</button>`;
+  } else if (role === 'admin' && state !== 'closed') {
+    actions = `
+      <button class="btn-secondary" onclick="closeModal('window-detail-modal'); endWindow('${w.id}')">${state === 'open' ? 'End now' : 'Cancel window'}</button>
+      <button class="btn-primary" onclick="closeModal('window-detail-modal'); showWindowForm('${w.id}')">Edit Window</button>`;
+  }
+
+  document.getElementById('wd-title').innerHTML = windowTitle(w);
+  document.getElementById('wd-sub').innerHTML = `<span class="win-badge win-badge-${state}">${badge}</span> ${timing}`;
+  document.getElementById('wd-body').innerHTML = `
+    <div class="detail-section">
+      <h4>Window Details</h4>
+      <div class="detail-grid">
+        ${rows.map(([label, value]) => `<div class="detail-item"><label>${label}</label><span>${value}</span></div>`).join('')}
+      </div>
+    </div>
+    <div class="detail-section">
+      <h4>Professor${byProf.size > 1 ? 's' : ''}</h4>
+      <div class="wd-profs">${profRows}</div>
+    </div>
+    ${actions ? `<div class="form-actions">${actions}</div>` : ''}`;
+  openModal('window-detail-modal');
+}
+
+// ----- Student: "Open re-evaluation" section -----
+function renderStudentOpenWindows() {
+  const el = document.getElementById('student-open-windows');
+  if (!el || !currentUser) return;
+  const now = Date.now();
+  const open = getWindows().filter(w => windowStateOf(w, now) === 'open').sort((a, b) => windowEnd(a) - windowEnd(b));
+  const upcoming = getWindows().filter(w => windowStateOf(w, now) === 'scheduled').sort((a, b) => a.startsAt - b.startsAt);
+
+  const cards = open.map(w => {
+    const applied = hasAppliedInWindow(w.id);
+    return `<div class="win-card" onclick="openWindowDetail('${w.id}')" title="View details">
+      <div class="win-card-top">
+        <div class="win-card-title">${windowTitle(w)}</div>
+        <span class="win-badge win-badge-open">● Open</span>
+      </div>
+      <div class="win-meta">
+        <span>📝 ${escapeHtml(w.examType)}</span>
+        <span>📅 ${escapeHtml(w.term)}</span>
+        <span>🏷️ ${sectionsLabel(w)}</span>
+      </div>
+      <div class="win-card-foot">
+        <span class="win-countdown">⏳ Closes in ${formatTimeLeft(windowEnd(w) - now)}</span>
+        ${applied
+          ? '<button class="btn-secondary" disabled>✓ Applied</button>'
+          : `<button class="btn-primary" onclick="event.stopPropagation(); showStudentForm('${w.id}')">Apply</button>`}
+      </div>
+    </div>`;
+  }).join('');
+
+  const upcomingHtml = upcoming.length
+    ? `<div class="win-upcoming"><strong>Coming up:</strong> ${upcoming.map(w =>
+        `<span class="win-upcoming-item" onclick="openWindowDetail('${w.id}')">${escapeHtml(w.subject)} · ${escapeHtml(w.examType)} — opens ${formatDateTime(w.startsAt)}</span>`).join('')}</div>`
+    : '';
+
+  el.innerHTML = `
+    <div class="open-windows-head">
+      <h3>Open re-evaluation</h3>
+      <span>You can apply only while a window is open for your exam. Click a window for details.</span>
+    </div>
+    ${open.length ? `<div class="win-grid">${cards}</div>` : '<div class="win-empty">No re-evaluation windows are open right now.</div>'}
+    ${upcomingHtml}`;
+}
+
+// ----- Professor: small "Re-evaluation Open" strip -----
+function renderProfOpenWindows() {
+  const el = document.getElementById('prof-open-windows');
+  if (!el || !currentUser) return;
+  const mine = getProfMapEntriesForUser();
+  const profName = resolveProfessorName(currentUser.email);
+  const now = Date.now();
+
+  const rows = getWindows().filter(w => windowStateOf(w, now) === 'open').map(w => {
+    let who;
+    if (w.sections.length) {
+      const sections = [...new Set(mine.filter(e => e.subject === w.subject).flatMap(e => e.sections))]
+        .filter(sec => w.sections.includes(sec)).sort();
+      if (!sections.length) return '';
+      who = (sections.length > 1 ? 'Sections ' : 'Section ') + sections.join(', ');
+    } else {
+      if (w.professor !== profName) return '';
+      who = 'All students';
+    }
+    const count = requestsInWindow(w.id).filter(r => r.professorName === profName).length;
+    return `<div class="prof-win-row" onclick="openWindowDetail('${w.id}')" title="View details">
+      <span class="win-badge win-badge-open">● Re-evaluation Open</span>
+      <span class="prof-win-title">${windowTitle(w)} · ${escapeHtml(w.examType)} · ${escapeHtml(w.term)}</span>
+      <span class="prof-win-meta">${who} · closes in ${formatTimeLeft(windowEnd(w) - now)} · ${count} request${count === 1 ? '' : 's'} so far</span>
+    </div>`;
+  }).filter(Boolean);
+
+  el.innerHTML = rows.join('');
+  el.style.display = rows.length ? '' : 'none';
+}
+
+// ----- Admin dashboard -----
+function initAdminDashboard() {
+  document.getElementById('admin-nav-user').textContent = 'Welcome, ' + currentUser.name;
+  renderAdminDashboard();
+}
+
+function renderAdminDashboard() {
+  renderAdminStats();
+  renderAdminWindows(currentAdminTab);
+}
+
+function renderAdminStats() {
+  const now = Date.now();
+  const ws = getWindows();
+  const stats = [
+    { label: 'Open Now', val: ws.filter(w => windowStateOf(w, now) === 'open').length },
+    { label: 'Scheduled', val: ws.filter(w => windowStateOf(w, now) === 'scheduled').length },
+    { label: 'Closed', val: ws.filter(w => windowStateOf(w, now) === 'closed').length },
+    { label: 'Requests Received', val: getRequests().filter(r => r.windowId).length },
+  ];
+  document.getElementById('admin-stats').innerHTML = stats.map(st =>
+    `<div class="stat-card"><div class="stat-number">${st.val}</div><div class="stat-label">${st.label}</div></div>`
+  ).join('');
+}
+
+function switchAdminTab(tab, el) {
+  currentAdminTab = tab;
+  document.querySelectorAll('#page-admin .tab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  renderAdminWindows(tab);
+}
+
+function renderAdminWindows(tab) {
+  const now = Date.now();
+  let ws = getWindows().slice();
+  if (tab !== 'all') ws = ws.filter(w => windowStateOf(w, now) === tab);
+  const order = { open: 0, scheduled: 1, closed: 2 };
+  ws.sort((a, b) => (order[windowStateOf(a, now)] - order[windowStateOf(b, now)]) ||
+    (windowStateOf(a, now) === 'closed' ? windowEnd(b) - windowEnd(a) : windowEnd(a) - windowEnd(b)));
+
+  const grid = document.getElementById('admin-windows-grid');
+  if (!ws.length) {
+    const empty = { open: 'No windows are open right now.', scheduled: 'No windows are scheduled.', closed: 'No windows have closed yet.', all: 'No re-evaluation windows yet.' }[tab];
+    grid.innerHTML = `<div class="empty-state"><div class="empty-icon">🗓️</div><p>${empty}</p></div>`;
+    return;
+  }
+  grid.innerHTML = ws.map(adminWindowCard).join('');
+}
+
+function adminWindowCard(w) {
+  const now = Date.now();
+  const state = windowStateOf(w, now);
+  const count = requestsInWindow(w.id).length;
+  const endedEarly = w.closedAt && w.closedAt < w.endsAt;
+  const badge = { open: '● Open', scheduled: 'Scheduled', closed: endedEarly ? 'Ended early' : 'Closed' }[state];
+  const timing = state === 'open' ? `Closes in ${formatTimeLeft(windowEnd(w) - now)}`
+    : state === 'scheduled' ? `Opens in ${formatTimeLeft(w.startsAt - now)}`
+    : `Closed ${formatDateTime(windowEnd(w))}`;
+  const actions = state === 'closed' ? '' : `
+    <span class="win-admin-actions">
+      <button class="btn-secondary btn-end" onclick="event.stopPropagation(); showWindowForm('${w.id}')">Edit</button>
+      <button class="btn-secondary btn-end" onclick="event.stopPropagation(); endWindow('${w.id}')">${state === 'open' ? 'End now' : 'Cancel'}</button>
+    </span>`;
+
+  return `<div class="request-card win-admin-card" onclick="openWindowDetail('${w.id}')" title="View details">
+    <div class="card-top">
+      <div class="card-subject">${windowTitle(w)}</div>
+      <span class="win-badge win-badge-${state}">${badge}</span>
+    </div>
+    <div class="card-meta">
+      <span class="meta-item">📝 ${escapeHtml(w.examType)}</span>
+      <span class="meta-item">📅 ${escapeHtml(w.term)}</span>
+      <span class="meta-item">🏷️ ${sectionsLabel(w)}</span>
+    </div>
+    <div class="win-times">
+      <div><label>Opens</label><span>${formatDateTime(w.startsAt)}</span></div>
+      <div><label>Closes</label><span>${formatDateTime(windowEnd(w))}</span></div>
+    </div>
+    <div class="win-admin-foot">
+      <span>${timing} · ${count} request${count === 1 ? '' : 's'}</span>
+      ${actions}
+    </div>
+  </div>`;
+}
+
+// ----- Admin: open / edit window form -----
+function toLocalInput(ts) {
+  const d = new Date(ts);
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function fromLocalInput(value) {
+  return value ? new Date(value).getTime() : NaN;
+}
+
+// Built-in exam types plus any custom ones admins have used before
+function examTypeOptions() {
+  const custom = getWindows().map(w => w.examType)
+    .filter(t => t && !DEFAULT_EXAM_TYPES.some(d => d.toLowerCase() === t.toLowerCase()));
+  return [...DEFAULT_EXAM_TYPES, ...new Set(custom)];
+}
+
+function selectedWindowSubject() {
+  const choice = document.getElementById('w-subject').value;
+  return choice === OTHER_OPTION ? document.getElementById('w-subject-custom').value.trim() : choice;
+}
+
+function tickedSections() {
+  return Array.from(document.querySelectorAll('#w-sections input:checked')).map(b => b.value);
+}
+
+const optionHtml = v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`;
+
+// Opens the form empty (new window) or filled in from an existing one (edit)
+function showWindowForm(editId) {
+  const w = editId ? getWindows().find(x => x.id === editId) : null;
+  if (editId && (!w || windowStateOf(w) === 'closed')) { showToast('A closed window can no longer be edited.', 'error'); return; }
+  _editingWindowId = w ? w.id : null;
+  document.getElementById('window-form').reset();
+
+  // Subjects from the course mapping, plus any typed in for earlier windows, plus "other"
+  const subjects = [...new Set([...getUniqueSubjects(), ...getWindows().map(x => x.subject)])];
+  document.getElementById('w-subject').innerHTML = '<option value="">Select subject</option>' +
+    subjects.map(optionHtml).join('') + `<option value="${OTHER_OPTION}">+ Other subject…</option>`;
+  document.getElementById('w-examtype').innerHTML = '<option value="">Select type</option>' +
+    examTypeOptions().map(optionHtml).join('') + `<option value="${OTHER_OPTION}">+ Add another type…</option>`;
+
+  if (w) {
+    document.getElementById('w-subject').value = w.subject;
+    document.getElementById('w-code').value = w.courseCode || '';
+    document.getElementById('w-examtype').value = w.examType;
+    document.getElementById('w-term').value = w.term;
+  }
+  onWindowSubjectChange(w ? w.sections : []);
+  onWindowExamTypeChange(false);
+  if (w && !w.sections.length) document.getElementById('w-prof').value = w.professor || '';
+
+  // Times: new windows open now for 24 hours; edits keep their own times
+  const start = w ? w.startsAt : Math.floor(Date.now() / 60000) * 60000;
+  const end = w ? w.endsAt : start + WINDOW_LENGTH_MS;
+  document.getElementById('w-start').value = toLocalInput(start);
+  document.getElementById('w-end').value = toLocalInput(end);
+  document.getElementById('w-24h').checked = end - start === WINDOW_LENGTH_MS;
+  onWindow24hChange();
+
+  // After students apply, the exam they applied for is fixed (the server enforces the same rules)
+  const applied = w ? requestsInWindow(w.id) : [];
+  const locked = applied.length > 0;
+  ['w-subject', 'w-subject-custom', 'w-examtype', 'w-examtype-custom', 'w-term', 'w-start', 'w-prof']
+    .forEach(id => { document.getElementById(id).disabled = locked; });
+  if (locked) {
+    const usedSections = new Set(applied.map(r => r.section).filter(Boolean));
+    document.querySelectorAll('#w-sections input').forEach(b => {
+      if (!w.sections.length || usedSections.has(b.value)) b.disabled = true;
+    });
+  }
+  const note = document.getElementById('w-lock-note');
+  note.style.display = locked ? '' : 'none';
+  note.textContent = locked
+    ? `🔒 ${applied.length} student${applied.length === 1 ? ' has' : 's have'} already applied, so the subject, exam type, term, opening time and existing sections can't change. You can still edit the course code, add sections and move the closing time.`
+    : '';
+
+  document.getElementById('window-form-title').textContent = w ? 'Edit Re-evaluation Window' : 'Open Re-evaluation Window';
+  document.getElementById('window-form-submit').textContent = w ? 'Save Changes' : 'Open Window';
+  openModal('window-form-modal');
+}
+
+// Sections come from the course mapping; they're optional, and none means the whole subject
+function onWindowSubjectChange(preselect) {
+  const choice = document.getElementById('w-subject').value;
+  const custom = choice === OTHER_OPTION;
+  const customInput = document.getElementById('w-subject-custom');
+  customInput.style.display = custom ? '' : 'none';
+  customInput.required = custom;
+  if (custom && preselect === undefined) customInput.focus();
+
+  const subject = custom ? '' : choice;
+  const available = new Set(getEntriesForSubject(subject).flatMap(e => e.sections));
+  const ticked = new Set(Array.isArray(preselect) ? preselect : tickedSections());
+  const picker = document.getElementById('w-sections');
+  const hint = document.getElementById('w-sections-hint');
+
+  if (!choice) {
+    picker.innerHTML = '';
+    hint.textContent = 'Select a subject to see its sections.';
+  } else if (!available.size) {
+    picker.innerHTML = '';
+    hint.textContent = 'This subject has no sections, so every student taking it can apply. Choose the reviewing professor below.';
+  } else {
+    picker.innerHTML = ALL_SECTIONS.map(sec => `
+      <label class="section-chip${available.has(sec) ? '' : ' disabled'}">
+        <input type="checkbox" value="${sec}"${available.has(sec) ? '' : ' disabled'}${available.has(sec) && ticked.has(sec) ? ' checked' : ''} /> ${sec}
+      </label>`).join('') +
+      '<button type="button" class="btn-secondary btn-select-all" onclick="toggleAllSections()">Select all</button>';
+    hint.textContent = 'Optional — leave all unticked if this exam isn\'t split by section; every student of the subject can then apply.' +
+      (available.size < ALL_SECTIONS.length ? ' Greyed-out sections have no professor for this subject.' : '');
+  }
+  updateWindowProfessorField();
+}
+
+function onWindowSectionsChange() {
+  updateWindowProfessorField();
+}
+
+function toggleAllSections() {
+  const boxes = Array.from(document.querySelectorAll('#w-sections input:not(:disabled)'));
+  const allOn = boxes.every(b => b.checked);
+  boxes.forEach(b => { b.checked = !allOn; });
+  updateWindowProfessorField();
+}
+
+// With no section ticked, the admin names the professor who reviews every request
+function updateWindowProfessorField() {
+  const group = document.getElementById('w-prof-group');
+  const sel = document.getElementById('w-prof');
+  const needed = !!document.getElementById('w-subject').value && tickedSections().length === 0;
+  group.style.display = needed ? '' : 'none';
+  sel.required = needed;
+  if (!needed) return;
+
+  const teaching = [...new Set(getEntriesForSubject(selectedWindowSubject()).map(e => e.professor))];
+  const others = Object.keys(PROF_EMAILS).filter(p => !teaching.includes(p));
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">Select professor</option>' +
+    (teaching.length ? `<optgroup label="Teaches this subject">${teaching.map(optionHtml).join('')}</optgroup>` : '') +
+    `<optgroup label="${teaching.length ? 'Other faculty' : 'Faculty'}">${others.map(optionHtml).join('')}</optgroup>`;
+  if (keep) sel.value = keep;
+}
+
+function onWindowExamTypeChange(focus = true) {
+  const custom = document.getElementById('w-examtype').value === OTHER_OPTION;
+  const input = document.getElementById('w-examtype-custom');
+  input.style.display = custom ? '' : 'none';
+  input.required = custom;
+  if (custom && focus) input.focus();
+}
+
+// With "24-hour window" ticked, the closing time follows the opening time
+function onWindowStartChange() {
+  if (document.getElementById('w-24h').checked) setWindowEndFromStart();
+  updateWindowLength();
+}
+
+function onWindow24hChange() {
+  const on = document.getElementById('w-24h').checked;
+  document.getElementById('w-end').disabled = on;
+  if (on) setWindowEndFromStart();
+  updateWindowLength();
+}
+
+function setWindowEndFromStart() {
+  const start = fromLocalInput(document.getElementById('w-start').value);
+  if (Number.isFinite(start)) document.getElementById('w-end').value = toLocalInput(start + WINDOW_LENGTH_MS);
+}
+
+function updateWindowLength() {
+  const start = fromLocalInput(document.getElementById('w-start').value);
+  const end = fromLocalInput(document.getElementById('w-end').value);
+  const el = document.getElementById('w-length');
+  if (!Number.isFinite(start) || !Number.isFinite(end)) { el.textContent = ''; return; }
+  if (end <= start) {
+    el.textContent = '⚠️ The window must close after it opens.';
+    el.style.color = 'var(--danger)';
+    return;
+  }
+  const hours = Math.round((end - start) / 360000) / 10;
+  el.textContent = `Window length: ${hours} hour${hours === 1 ? '' : 's'}` +
+    (start > Date.now() + 60000 ? ' · opens in ' + formatTimeLeft(start - Date.now()) : '');
+  el.style.color = '';
+}
+
+async function submitWindowForm(e) {
+  e.preventDefault();
+  const typeChoice = document.getElementById('w-examtype').value;
+  const examType = typeChoice === OTHER_OPTION ? document.getElementById('w-examtype-custom').value.trim() : typeChoice;
+  const sections = tickedSections();
+  const editing = _editingWindowId;
+  const payload = {
+    subject: selectedWindowSubject(),
+    courseCode: document.getElementById('w-code').value.trim(),
+    examType,
+    sections,
+    professor: sections.length ? '' : document.getElementById('w-prof').value,
+    term: document.getElementById('w-term').value.trim(),
+    startsAt: fromLocalInput(document.getElementById('w-start').value),
+    endsAt: fromLocalInput(document.getElementById('w-end').value),
+    [editing ? 'updatedBy' : 'createdBy']: currentUser.email,
+  };
+  if (!payload.subject) { showToast('Please choose or enter the subject.', 'error'); return; }
+  if (!examType) { showToast('Please choose or enter the type of exam.', 'error'); return; }
+  if (!payload.term) { showToast('Please enter the term.', 'error'); return; }
+  if (!sections.length && !payload.professor) { showToast('No section is selected, so please choose the reviewing professor.', 'error'); return; }
+  if (!(payload.endsAt > payload.startsAt)) { showToast('The window must close after it opens.', 'error'); return; }
+  if (payload.endsAt <= Date.now()) { showToast('The closing time is already in the past.', 'error'); return; }
+
+  let saved;
+  if (_serverMode) {
+    try {
+      const res = await fetch(editing ? `/api/windows/${encodeURIComponent(editing)}` : '/api/windows', {
+        method: editing ? 'PUT' : 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not save the window');
+      saved = data.window;
+    } catch (err) {
+      showToast(err.message, 'error');
+      return;
+    }
+  } else if (editing) {
+    saved = { ...getWindows().find(x => x.id === editing), ...payload };
+  } else {
+    saved = { id: 'WIN-' + Date.now().toString(36).toUpperCase(), ...payload, closedAt: null, createdAt: Date.now() };
+  }
+
+  const idx = _windows.findIndex(x => x.id === saved.id);
+  if (idx === -1) _windows.push(saved); else _windows[idx] = saved;
+  saveWindowsLocally();
+  _editingWindowId = null;
+
+  closeModal('window-form-modal');
+  const state = windowStateOf(saved);
+  const tabIndex = { open: 0, scheduled: 1, closed: 2 }[state];
+  switchAdminTab(state, document.querySelectorAll('#page-admin .tab')[tabIndex]);
+  renderAdminStats();
+  showToast(editing ? 'Changes saved.'
+    : state === 'open' ? `Re-evaluation window opened for ${saved.subject} · ${saved.examType}.`
+    : `Window scheduled — opens ${formatDateTime(saved.startsAt)}.`, 'success');
+}
+
+async function endWindow(id) {
+  const w = getWindows().find(x => x.id === id);
+  if (!w) return;
+  const verb = windowStateOf(w) === 'open' ? 'End' : 'Cancel';
+  if (!confirm(`${verb} the re-evaluation window for ${w.subject} · ${w.examType} now? Students will no longer be able to apply.`)) return;
+
+  if (_serverMode) {
+    try {
+      const res = await fetch(`/api/windows/${encodeURIComponent(id)}/close`, { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || 'Could not end the window');
+      Object.assign(w, data.window);
+    } catch (err) {
+      showToast(err.message, 'error');
+      return;
+    }
+  } else {
+    w.closedAt = Date.now();
+  }
+  saveWindowsLocally();
+  renderAdminDashboard();
+  showToast('Window closed.', 'success');
+}
+
+// ----- Routing and refresh -----
+function openDashboardForRole() {
+  if (currentUser.role === 'admin') {
+    showPage('page-admin');
+    initAdminDashboard();
+  } else if (currentUser.role === 'professor') {
+    showPage('page-professor');
+    initProfDashboard();
+  } else {
+    showPage('page-student');
+    initStudentDashboard();
+  }
+}
+
+// Every 30s: pick up windows opened elsewhere and keep countdowns current
+setInterval(async () => {
+  if (!currentUser) return;
+  await loadWindows();
+  if (currentUser.role === 'admin') {
+    if (_serverMode) await loadInitialData();
+    renderAdminDashboard();
+  } else if (currentUser.role === 'professor') {
+    renderProfOpenWindows();
+  } else {
+    renderStudentOpenWindows();
+  }
+}, 30000);
 
 // ===== FACULTY TEST CREDENTIALS PANEL (DEV MODE) =====
 function populateCreds() {
@@ -1263,6 +1820,24 @@ function populateCreds() {
       <span class="cred-name">${name.replace('Prof. ', '')}</span>
       <span class="cred-email" title="Click to log in as ${name}" onclick="testLoginAsFaculty('${email}', '${name}')">${email}</span>
     </div>`).join('');
+}
+
+// DEV: dummy admin accounts
+function populateAdminCreds() {
+  const container = document.getElementById('admin-creds-entries');
+  if (!container) return;
+  container.innerHTML = ADMIN_ACCOUNTS.map(a => `
+    <div class="cred-row">
+      <span class="cred-name">${a.name}</span>
+      <span class="cred-email" title="Click to log in as ${a.name}" onclick="testLoginAsAdmin('${a.email}', '${a.name}')">${a.email}</span>
+    </div>`).join('');
+}
+
+function testLoginAsAdmin(email, name) {
+  currentUser = { email: email.toLowerCase(), name, role: 'admin', picture: '' };
+  localStorage.setItem('reval_session', JSON.stringify(currentUser));
+  openDashboardForRole();
+  showToast('DEV login: ' + name, 'info');
 }
 
 function testLoginAsFaculty(email, name) {
@@ -1276,7 +1851,7 @@ function testLoginAsFaculty(email, name) {
 function fillEmail() { }
 
 function toggleCreds(btn) {
-  const list = document.getElementById('creds-list');
+  const list = btn.parentElement.querySelector('.creds-list');
   const arrow = btn.querySelector('.creds-arrow');
   const isOpen = list.style.display !== 'none';
   list.style.display = isOpen ? 'none' : 'block';
@@ -1352,17 +1927,15 @@ function jokaToast(type, section) {
 
 // ===== 4. DEADLINE COUNTDOWN TIMER =====
 let _countdownInterval = null;
-const RESULT_DECLARED_AT = Date.now() - (18 * 60 * 60 * 1000);
-const DEADLINE_DURATION = 24 * 60 * 60 * 1000;
 
 function startFormCountdown() {
   const el = document.getElementById('form-countdown');
   if (!el) return;
   if (_countdownInterval) clearInterval(_countdownInterval);
   function tick() {
-    const rem = (RESULT_DECLARED_AT + DEADLINE_DURATION) - Date.now();
+    const rem = _formWindow ? windowEnd(_formWindow) - Date.now() : 0;
     if (rem <= 0) {
-      el.textContent = 'DEADLINE PASSED';
+      el.textContent = 'WINDOW CLOSED';
       el.style.color = '#b83232';
       clearInterval(_countdownInterval);
       return;
@@ -1481,8 +2054,8 @@ function updateDesperationIndex() {
 
 // ===== WRAP EXISTING FUNCTIONS =====
 const _baseShowStudentForm = showStudentForm;
-showStudentForm = function () {
-  _baseShowStudentForm();
+showStudentForm = function (windowId) {
+  if (!_baseShowStudentForm(windowId)) return;
   startFormCountdown();
   const wrap = document.getElementById('desperation-wrap');
   if (wrap) wrap.style.display = 'none';
@@ -1492,41 +2065,6 @@ const _baseCloseModal = closeModal;
 closeModal = function (id) {
   _baseCloseModal(id);
   if (id === 'student-form-modal') stopFormCountdown();
-};
-
-const _baseSubmitRevalForm = submitRevalForm;
-submitRevalForm = async function (e) {
-  e.preventDefault();
-  const payment = await getPaymentForSubmission();
-  if (!payment.ok) return;
-  const section = document.getElementById('f-section').value;
-  if (!section) { showToast('Please select your section.', 'error'); return; }
-  const request = {
-    id: generateId(),
-    studentEmail: currentUser.email,
-    studentName: document.getElementById('f-name').value.trim(),
-    regNo: document.getElementById('f-regno').value.trim(),
-    professorName: document.getElementById('f-prof').value,
-    subject: document.getElementById('f-subject').value,
-    section: section,
-    examType: document.getElementById('f-examtype').value,
-    term: document.getElementById('f-term').value.trim(),
-    questions: document.getElementById('f-questions').value.trim(),
-    reason: document.getElementById('f-reason').value.trim(),
-    ...payment.fields,
-    status: 'Pending',
-    createdAt: Date.now(),
-    updatedMarks: null,
-    professorRemarks: null,
-  };
-  const requests = getRequests();
-  requests.push(request);
-  saveRequests(requests);
-  stopFormCountdown();
-  closeModal('student-form-modal');
-  renderStudentStats();
-  switchStudentTab('pending', document.querySelector('#page-student .tab'));
-  jokaToast('submit', section);
 };
 
 const _baseInitStudentDashboard = initStudentDashboard;

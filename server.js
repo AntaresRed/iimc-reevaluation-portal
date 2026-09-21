@@ -30,6 +30,7 @@ const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : pat
 const DATA_FILE = path.join(DATA_DIR, 'requests.json');
 const ARCHIVE_FILE = path.join(DATA_DIR, 'archive.json');
 const PAYMENTS_FILE = path.join(DATA_DIR, 'payments.json');
+const WINDOWS_FILE = path.join(DATA_DIR, 'windows.json');
 
 // ===== RAZORPAY CONFIG (POC) =====
 // Put RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env (use rzp_test_ keys while testing).
@@ -259,6 +260,240 @@ async function issueRefund(request, actor) {
     : { at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund initiated', by: 'Razorpay',
         note: `₹${request.refund.amount / 100} · ${request.refund.id}` });
   return request.refund;
+}
+
+// ===== RE-EVALUATION WINDOWS =====
+// Admins open a window for a subject + exam + term + sections. Students can only apply while it's open.
+const SECTIONS = ['A', 'B', 'C', 'D', 'E', 'F'];
+
+function readWindows() {
+  try { return JSON.parse(fs.readFileSync(WINDOWS_FILE, 'utf8')); }
+  catch { return { windows: [] }; }
+}
+
+function writeWindows(obj) {
+  fs.writeFileSync(WINDOWS_FILE, JSON.stringify(obj, null, 2), 'utf8');
+}
+
+// scheduled → open → closed (closed early when an admin ends it)
+function windowState(w, now = Date.now()) {
+  if (w.closedAt && w.closedAt <= now) return 'closed';
+  if (now < w.startsAt) return 'scheduled';
+  if (now >= w.endsAt) return 'closed';
+  return 'open';
+}
+
+function withState(w) {
+  return { ...w, state: windowState(w) };
+}
+
+function cleanText(value, max) {
+  return String(value == null ? '' : value).replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+// Validate and normalise admin input for a new or edited window.
+// Sections are optional: a window with none covers every student of the subject,
+// and then names the professor who reviews the requests.
+function windowFromInput(body) {
+  const w = {
+    subject: cleanText(body.subject, 120),
+    courseCode: cleanText(body.courseCode, 40),
+    examType: cleanText(body.examType, 40),
+    sections: [...new Set((Array.isArray(body.sections) ? body.sections : []).map(String))].filter(s => SECTIONS.includes(s)).sort(),
+    professor: cleanText(body.professor, 120),
+    term: cleanText(body.term, 60),
+    startsAt: Number(body.startsAt),
+    endsAt: Number(body.endsAt),
+  };
+  if (w.sections.length) w.professor = '';   // per-section professors come from the course mapping
+
+  const problems = [];
+  if (!w.subject) problems.push('subject');
+  if (!w.examType) problems.push('exam type');
+  if (!w.term) problems.push('term');
+  if (!w.sections.length && !w.professor) problems.push('the reviewing professor (needed when no section is selected)');
+  if (!Number.isFinite(w.startsAt) || !Number.isFinite(w.endsAt)) problems.push('opening and closing times');
+  if (problems.length) return { error: 'Missing ' + problems.join(', ') + '.' };
+  if (w.endsAt <= w.startsAt) return { error: 'The window must close after it opens.' };
+  if (w.endsAt <= Date.now()) return { error: 'The closing time is already in the past.' };
+  return { window: w };
+}
+
+// Two live windows may not cover the same exam and section. No sections = the whole subject.
+function findClash(candidate, windows, ignoreId) {
+  return windows.find(o =>
+    o.id !== ignoreId &&
+    windowState(o) !== 'closed' &&
+    o.subject.toLowerCase() === candidate.subject.toLowerCase() &&
+    o.examType.toLowerCase() === candidate.examType.toLowerCase() &&
+    o.term.toLowerCase() === candidate.term.toLowerCase() &&
+    (!o.sections.length || !candidate.sections.length || o.sections.some(s => candidate.sections.includes(s))) &&
+    o.startsAt < candidate.endsAt && candidate.startsAt < (o.closedAt || o.endsAt));
+}
+
+function clashMessage(clash, w) {
+  const overlap = clash.sections.length && w.sections.length
+    ? 'Section ' + clash.sections.filter(s => w.sections.includes(s)).join(', ')
+    : 'This subject';
+  return `${overlap} already has a window for ${clash.subject} · ${clash.examType} · ${clash.term}.`;
+}
+
+async function handleWindows(req, res) {
+  if (req.url === '/api/windows' && req.method === 'GET') {
+    sendJson(res, 200, { windows: readWindows().windows.map(withState), now: Date.now() });
+    return true;
+  }
+
+  if (req.url === '/api/windows' && req.method === 'POST') {
+    try {
+      const body = await readJsonBody(req);
+      const parsed = windowFromInput(body);
+      if (parsed.error) { sendJson(res, 400, { error: parsed.error }); return true; }
+      const w = {
+        id: 'WIN-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase(),
+        ...parsed.window,
+        closedAt: null,
+        createdBy: cleanText(body.createdBy, 200),
+        createdAt: Date.now(),
+      };
+      const store = readWindows();
+      const clash = findClash(w, store.windows);
+      if (clash) { sendJson(res, 409, { error: clashMessage(clash, w) }); return true; }
+
+      store.windows.push(w);
+      writeWindows(store);
+      sendJson(res, 200, { window: withState(w) });
+    } catch (e) {
+      sendJson(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  // PUT /api/windows/:id — edit an open or scheduled window
+  const edit = req.url.match(/^\/api\/windows\/([^/]+)$/);
+  if (edit && req.method === 'PUT') {
+    try {
+      const body = await readJsonBody(req);
+      const store = readWindows();
+      const w = store.windows.find(o => o.id === decodeURIComponent(edit[1]));
+      if (!w) { sendJson(res, 404, { error: 'Window not found.' }); return true; }
+      if (windowState(w) === 'closed') { sendJson(res, 409, { error: 'A closed window can no longer be edited.' }); return true; }
+
+      const parsed = windowFromInput(body);
+      if (parsed.error) { sendJson(res, 400, { error: parsed.error }); return true; }
+      const next = parsed.window;
+
+      // Once students have applied, the exam they applied for must stay the same
+      const data = readData();
+      const applied = (data.requests || []).filter(r => r.windowId === w.id);
+      if (applied.length) {
+        const locked = [];
+        if (next.subject !== w.subject) locked.push('subject');
+        if (next.examType !== w.examType) locked.push('exam type');
+        if (next.term !== w.term) locked.push('term');
+        if (next.startsAt !== w.startsAt) locked.push('opening time');
+        if (!w.sections.length && (next.sections.length || next.professor !== w.professor)) locked.push('professor');
+        if (w.sections.length && !next.sections.length) locked.push('sections');
+        const usedSections = [...new Set(applied.map(r => r.section).filter(Boolean))];
+        const dropped = w.sections.length ? usedSections.filter(s => !next.sections.includes(s)) : [];
+        if (dropped.length) locked.push('section ' + dropped.join(', ') + ' (students have applied)');
+        if (locked.length) {
+          sendJson(res, 409, { error: `${applied.length} student${applied.length === 1 ? ' has' : 's have'} already applied, so these can't change: ${locked.join(', ')}.` });
+          return true;
+        }
+      }
+
+      const clash = findClash(next, store.windows, w.id);
+      if (clash) { sendJson(res, 409, { error: clashMessage(clash, next) }); return true; }
+
+      Object.assign(w, next, { updatedAt: Date.now(), updatedBy: cleanText(body.updatedBy, 200) });
+      writeWindows(store);
+
+      // Keep the course code on existing requests in step with the window
+      if (applied.length) {
+        for (const r of data.requests) if (r.windowId === w.id) r.courseCode = w.courseCode;
+        saveAndArchive(data);
+      }
+      sendJson(res, 200, { window: withState(w) });
+    } catch (e) {
+      sendJson(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  const m = req.url.match(/^\/api\/windows\/([^/]+)\/close$/);
+  if (m && req.method === 'POST') {
+    const store = readWindows();
+    const w = store.windows.find(o => o.id === decodeURIComponent(m[1]));
+    if (!w) { sendJson(res, 404, { error: 'Window not found.' }); return true; }
+    if (windowState(w) === 'closed') { sendJson(res, 409, { error: 'This window is already closed.' }); return true; }
+    w.closedAt = Date.now();
+    writeWindows(store);
+    sendJson(res, 200, { window: withState(w) });
+    return true;
+  }
+
+  return false;
+}
+
+// POST /api/requests/submit — the only way a new request is created
+async function handleSubmitRequest(req, res) {
+  try {
+    const body = await readJsonBody(req);
+    const incoming = body.request || {};
+    const w = readWindows().windows.find(o => o.id === incoming.windowId);
+    if (!w) { sendJson(res, 400, { error: 'This re-evaluation window no longer exists.' }); return; }
+    const state = windowState(w);
+    if (state !== 'open') {
+      sendJson(res, 409, { error: state === 'scheduled' ? 'This re-evaluation window has not opened yet.' : 'This re-evaluation window has closed.' });
+      return;
+    }
+    if (w.sections.length && !w.sections.includes(incoming.section)) {
+      sendJson(res, 400, { error: `Section ${incoming.section || '—'} is not part of this re-evaluation window.` });
+      return;
+    }
+    const email = cleanText(incoming.studentEmail, 200).toLowerCase();
+    if (!email) { sendJson(res, 400, { error: 'Missing student email.' }); return; }
+
+    const data = readData();
+    data.requests = data.requests || [];
+    if (data.requests.some(r => r.windowId === w.id && (r.studentEmail || '').toLowerCase() === email)) {
+      sendJson(res, 409, { error: 'You have already applied for re-evaluation in this window.' });
+      return;
+    }
+    if (incoming.upiUtr && data.requests.some(r => r.upiUtr === incoming.upiUtr)) {
+      sendJson(res, 409, { error: 'That UPI reference number is already used by another request.' });
+      return;
+    }
+
+    // Exam details come from the window, never from the browser; review fields start empty
+    const { refund, paymentVerified, reviewedAt, updatedMarks, professorRemarks, history, status, ...fresh } = incoming;
+    const now = Date.now();
+    const request = {
+      ...fresh,
+      id: cleanText(fresh.id, 60) || 'IIMC-' + now.toString(36).toUpperCase(),
+      studentEmail: email,
+      windowId: w.id,
+      subject: w.subject,
+      courseCode: w.courseCode,
+      examType: w.examType,
+      term: w.term,
+      ...(w.sections.length ? {} : { professorName: w.professor }),
+      status: 'Pending',
+      createdAt: now,
+      updatedMarks: null,
+      professorRemarks: null,
+      history: [{ at: now, event: 'Submitted', by: email, note: '' }],
+    };
+    if (request.paymentMethod === 'upi') request.paymentVerified = false;
+    if (data.requests.some(r => r.id === request.id)) request.id += '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
+
+    data.requests.push(request);
+    saveAndArchive(data);
+    sendJson(res, 200, { request });
+  } catch (e) {
+    sendJson(res, 400, { error: e.message });
+  }
 }
 
 function findRequest(data, id) {
@@ -525,13 +760,8 @@ const server = http.createServer((req, res) => {
         for (const incoming of payload.requests) {
           const existing = byId.get(incoming.id);
           if (!existing) {
-            const { refund, paymentVerified, ...fresh } = incoming;
-            // One UPI reference number can back only one request
-            if (fresh.upiUtr && [...byId.values()].some(r => r.upiUtr === fresh.upiUtr)) {
-              throw new Error('UPI reference ' + fresh.upiUtr + ' is already used by another request.');
-            }
-            if (fresh.paymentMethod === 'upi') fresh.paymentVerified = false;
-            byId.set(incoming.id, fresh);
+            // New requests must go through /api/requests/submit (window checks); ignore them here
+            continue;
           } else {
             const merged = { ...existing, ...incoming };
             // Review fields change only through /api/requests/:id/review (except when the server has none yet)
@@ -560,6 +790,20 @@ const server = http.createServer((req, res) => {
     const archive = readArchive();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(archive));
+    return;
+  }
+
+  // ── Re-evaluation windows ──
+  if (req.url.startsWith('/api/windows')) {
+    handleWindows(req, res).then(handled => {
+      if (!handled) sendJson(res, 404, { error: 'Not Found' });
+    });
+    return;
+  }
+
+  // ── New request (window-checked) ──
+  if (req.url === '/api/requests/submit' && req.method === 'POST') {
+    handleSubmitRequest(req, res);
     return;
   }
 
