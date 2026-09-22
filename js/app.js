@@ -101,10 +101,19 @@ let _serverMode = false;  // true when server is reachable
 // Sync getter — always use the cache
 function getRequests() { return _cache; }
 
+// Browsers cap local storage (~5 MB), which photos can fill on their own
+function cacheRequestsLocally(requests) {
+  try {
+    localStorage.setItem('reval_requests', JSON.stringify(requests));
+  } catch {
+    showToast('This browser could not store the request locally — it is too large. Use the portal with the server running.', 'error');
+  }
+}
+
 // Save: update cache + localStorage + (background) POST to server
 function saveRequests(requests) {
   _cache = requests;
-  localStorage.setItem('reval_requests', JSON.stringify(requests));
+  cacheRequestsLocally(requests);
   if (_serverMode) {
     fetch(SERVER_API, {
       method: 'POST',
@@ -130,7 +139,7 @@ async function refreshRequests() {
     const res = await fetch(SERVER_API, { signal: AbortSignal.timeout(3000) });
     if (!res.ok) return false;
     _cache = (await res.json()).requests || [];
-    localStorage.setItem('reval_requests', JSON.stringify(_cache));
+    cacheRequestsLocally(_cache);
     return true;
   } catch { return false; }
 }
@@ -147,12 +156,14 @@ async function submitNewRequest(request) {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data.error || 'Submission failed');
     _cache.push(data.request);
-    localStorage.setItem('reval_requests', JSON.stringify(_cache));
+    cacheRequestsLocally(_cache);
     return data.request;
   }
+  // Offline: the request (photos and all) only exists in this browser
   const requests = getRequests();
   requests.push(request);
   saveRequests(requests);
+  showToast('Saved on this device only — the portal server was not reachable, so nothing was sent to it.', 'error');
   return request;
 }
 
@@ -165,7 +176,7 @@ async function loadInitialData() {
     _cache = data.requests || [];
     _serverMode = true;
     // Keep localStorage in sync
-    localStorage.setItem('reval_requests', JSON.stringify(_cache));
+    cacheRequestsLocally(_cache);
     console.log(`[Storage] Server mode — ${_cache.length} requests loaded from data/requests.json`);
   } catch {
     // Server not running — use localStorage
@@ -358,7 +369,10 @@ function photoName(photo) {
 }
 
 function photoUrl(requestId, photo) {
-  return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(photoName(photo))}`;
+  // Offline submissions keep the picture itself in the browser — show it directly
+  const name = photoName(photo);
+  if (name.startsWith('data:image/')) return name;
+  return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(name)}`;
 }
 
 function questionListHtml(r) {
@@ -393,7 +407,7 @@ function escapeHtml(s) {
 function replaceCachedRequest(updated) {
   const idx = _cache.findIndex(x => x.id === updated.id);
   if (idx !== -1) _cache[idx] = updated; else _cache.push(updated);
-  localStorage.setItem('reval_requests', JSON.stringify(_cache));
+  cacheRequestsLocally(_cache);
 }
 
 async function postRequestAction(id, action, body) {
