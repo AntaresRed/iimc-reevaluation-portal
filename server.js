@@ -1,7 +1,7 @@
 /**
  * IIM Calcutta Re-Evaluation Portal — Local Server
  * Zero dependencies: uses only built-in Node.js modules.
- * All request data is saved to data/requests.json on disk.
+ * Requests are saved to data/requests.json; question photos to data/uploads/.
  * An append-only archive is maintained at data/archive.json.
  *
  * Usage:  node server.js
@@ -9,7 +9,6 @@
  */
 
 const http = require('http');
-const https = require('https');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -29,25 +28,12 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : path.join(ROOT, 'data');
 const DATA_FILE = path.join(DATA_DIR, 'requests.json');
 const ARCHIVE_FILE = path.join(DATA_DIR, 'archive.json');
-const PAYMENTS_FILE = path.join(DATA_DIR, 'payments.json');
 const WINDOWS_FILE = path.join(DATA_DIR, 'windows.json');
 const FACULTY_FILE = path.join(DATA_DIR, 'faculty.json');
+const BLOCKS_FILE = path.join(DATA_DIR, 'blocks.json');
+const UPLOADS_DIR = path.join(DATA_DIR, 'uploads');
 
-// ===== RAZORPAY CONFIG (POC) =====
-// Put RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET in .env (use rzp_test_ keys while testing).
-const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
-const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
-const RAZORPAY_ENABLED = Boolean(RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET);
-// Optional: Dashboard → Webhooks, events refund.processed + refund.failed → <public URL>/api/razorpay/webhook
-const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET || '';
-// Flat fee per re-evaluation request, in rupees (override with PAYMENT_AMOUNT_INR in .env)
-const PAYMENT_AMOUNT_INR = Number(process.env.PAYMENT_AMOUNT_INR) || 10;
-
-// ===== UPI CONFIG =====
-// The college UPI ID students pay by QR. Plain UPI has no test mode and cannot tell this app
-// that money arrived: the office matches UTRs against the bank statement and refunds by hand.
-const UPI_VPA = process.env.UPI_VPA || '';
-const UPI_PAYEE_NAME = process.env.UPI_PAYEE_NAME || 'IIM Calcutta';
+const drive = require('./drive.js');   // reads its settings from .env, loaded above
 
 // Ensure data directory and files exist
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -134,159 +120,37 @@ function archiveRequests(newRequests) {
   if (changed) writeJsonFile(ARCHIVE_FILE, archive);
 }
 
-// ===== RAZORPAY HELPERS =====
+// ===== HTTP HELPERS =====
 function sendJson(res, status, obj) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(obj));
 }
 
 // Request bodies are capped so one oversized upload can't exhaust the server's memory
-const MAX_BODY_BYTES = 1048576;
+const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_SUBMIT_BYTES = 25 * 1024 * 1024;   // a request with photos
 
-function readRawBody(req) {
+function readRawBody(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
-      if (size <= MAX_BODY_BYTES) chunks.push(chunk);   // keep draining, but stop storing
+      if (size <= maxBytes) chunks.push(chunk);   // keep draining, but stop storing
     });
     req.on('end', () => {
-      if (size > MAX_BODY_BYTES) reject(new Error('Request is too large.'));
+      if (size > maxBytes) reject(new Error('Request is too large. Try fewer or smaller photos.'));
       else resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
   });
 }
 
-async function readJsonBody(req) {
-  const raw = await readRawBody(req);
+async function readJsonBody(req, maxBytes) {
+  const raw = await readRawBody(req, maxBytes);
   if (!raw.length) return {};
   try { return JSON.parse(raw.toString('utf8')); }
   catch { throw new Error('The request body is not valid JSON.'); }
-}
-
-// Minimal Razorpay REST client: https://razorpay.com/docs/api/orders/
-function razorpayApi(method, apiPath, body) {
-  return new Promise((resolve, reject) => {
-    const payload = body ? JSON.stringify(body) : '';
-    const auth = Buffer.from(`${RAZORPAY_KEY_ID}:${RAZORPAY_KEY_SECRET}`).toString('base64');
-    const apiReq = https.request({
-      hostname: 'api.razorpay.com',
-      path: apiPath,
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload),
-        'Authorization': `Basic ${auth}`,
-      },
-    }, apiRes => {
-      let data = '';
-      apiRes.on('data', chunk => { data += chunk; });
-      apiRes.on('end', () => {
-        let parsed;
-        try { parsed = JSON.parse(data); } catch { parsed = {}; }
-        if (apiRes.statusCode >= 200 && apiRes.statusCode < 300) resolve(parsed);
-        else reject(new Error((parsed.error && parsed.error.description) || `Razorpay returned ${apiRes.statusCode}`));
-      });
-    });
-    apiReq.on('error', reject);
-    apiReq.end(payload);
-  });
-}
-
-// Signature = HMAC_SHA256(order_id + "|" + payment_id, key_secret)
-function isValidPaymentSignature(orderId, paymentId, signature) {
-  const expected = crypto.createHmac('sha256', RAZORPAY_KEY_SECRET)
-    .update(`${orderId}|${paymentId}`).digest('hex');
-  const a = Buffer.from(expected);
-  const b = Buffer.from(String(signature || ''));
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-function readPayments() {
-  return readJsonFile(PAYMENTS_FILE, () => ({ payments: [] }));
-}
-
-function recordVerifiedPayment(entry) {
-  const store = readPayments();
-  if (store.payments.some(p => p.paymentId === entry.paymentId)) return;
-  store.payments.push(entry);
-  writeJsonFile(PAYMENTS_FILE, store);
-}
-
-// ===== FEE REFUND POLICY =====
-// Digital version of the demand-draft process: the fee is collected at submission,
-// refunded if the marks change (up or down), and retained if they don't.
-const REFUND_STATUSES = ['Resolved - Marks Increased', 'Resolved - Marks Decreased'];
-// Fields a review/refund action owns (copied onto the latest saved copy after a Razorpay call)
-const REVIEW_FIELDS = ['status', 'updatedMarks', 'professorRemarks', 'reviewedAt', 'history', 'refund', 'paymentVerified'];
-function isRefundActive(refund) {
-  return Boolean(refund && (refund.status === 'pending' || refund.status === 'processed'));
-}
-
-// Maps Razorpay's refund status onto ours: pending | processed | failed
-function refundFromRazorpay(entity, previous = {}) {
-  return {
-    ...previous,
-    id: entity.id,
-    amount: entity.amount,
-    status: entity.status === 'processed' ? 'processed' : entity.status === 'failed' ? 'failed' : 'pending',
-    processedAt: entity.status === 'processed' ? (previous.processedAt || Date.now()) : previous.processedAt || null,
-    error: null,
-  };
-}
-
-const refundsInFlight = new Set();  // request IDs with a refund call in progress
-
-// Issues the Razorpay refund for a request (idempotent). Mutates and returns request.refund.
-async function issueRefund(request, actor) {
-  if (isRefundActive(request.refund)) return request.refund;
-  if (request.paymentMethod !== 'razorpay' || !request.razorpayPaymentId) {
-    request.refund = {
-      status: 'manual',
-      note: request.paymentMethod === 'upi'
-        ? `Paid by UPI (UTR ${request.upiUtr || '—'}) — the MBA office sends the refund back to ${request.upiPayerVpa || 'the student'}.`
-        : 'Paid by receipt — the MBA office refunds this manually.',
-    };
-    return request.refund;
-  }
-  // Only refund payments this server verified, for the amount actually paid
-  const payment = readPayments().payments.find(p => p.paymentId === request.razorpayPaymentId);
-  if (!payment) {
-    request.refund = { status: 'failed', error: 'Payment was not verified by this server.', attemptedAt: Date.now() };
-    return request.refund;
-  }
-  if (!RAZORPAY_ENABLED) {
-    request.refund = { status: 'failed', error: 'Razorpay is not configured on the server.', attemptedAt: Date.now() };
-    return request.refund;
-  }
-  if (refundsInFlight.has(request.id)) throw new Error('A refund for this request is already in progress.');
-
-  refundsInFlight.add(request.id);
-  try {
-    // Guard against double refunds if an earlier attempt succeeded but wasn't saved
-    const existing = await razorpayApi('GET', `/v1/payments/${encodeURIComponent(payment.paymentId)}/refunds`);
-    const prior = (existing.items || []).find(r => r.status !== 'failed');
-    const entity = prior || await razorpayApi('POST', `/v1/payments/${encodeURIComponent(payment.paymentId)}/refund`, {
-      amount: payment.amount,
-      speed: 'normal',
-      receipt: request.id.slice(0, 40),
-      notes: { requestId: request.id, reason: request.status, initiatedBy: String(actor || '').slice(0, 256) },
-    });
-    request.refund = refundFromRazorpay(entity, { initiatedAt: Date.now(), initiatedBy: actor });
-  } catch (e) {
-    request.refund = { status: 'failed', error: e.message, attemptedAt: Date.now(), initiatedBy: actor };
-  } finally {
-    refundsInFlight.delete(request.id);
-  }
-
-  request.history = Array.isArray(request.history) ? request.history : [];
-  request.history.push(request.refund.status === 'failed'
-    ? { at: Date.now(), event: 'Refund failed', by: 'Razorpay', note: request.refund.error }
-    : { at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund initiated', by: 'Razorpay',
-        note: `₹${request.refund.amount / 100} · ${request.refund.id}` });
-  return request.refund;
 }
 
 // ===== RE-EVALUATION WINDOWS =====
@@ -498,10 +362,181 @@ async function handleFaculty(req, res) {
   return false;
 }
 
+// ===== DEACTIVATED STUDENTS =====
+// The office can switch off re-evaluation for a student. A block matches on email AND registration
+// number (either one is enough to refuse a request), picks up every other email / reg. no. the
+// student has used on past requests, and is never deleted — lifting it only stamps who and when,
+// so there's a full record. Submissions are checked here on the server, not just hidden in the page.
+function readBlocks() {
+  return readJsonFile(BLOCKS_FILE, () => ({ blocks: [] }));
+}
+
+function normEmail(value) {
+  return cleanText(value, 200).toLowerCase();
+}
+
+// "MBA/0042/62", " mba / 42 / 62 " and "MBA/042/62" all become "MBA/42/62"
+function normRegNo(value) {
+  return String(value == null ? '' : value).toUpperCase().replace(/\s+/g, '').replace(/\/0+(\d)/g, '/$1').slice(0, 40);
+}
+
+function activeBlockFor(email, regNo) {
+  const e = normEmail(email);
+  const r = normRegNo(regNo);
+  return readBlocks().blocks.find(b => !b.liftedAt &&
+    ((e && b.emails.includes(e)) || (r && b.regNos.includes(r))));
+}
+
+async function handleBlocks(req, res) {
+  // Everything, including lifted blocks (the admin's record)
+  if (req.url === '/api/blocks' && req.method === 'GET') {
+    sendJson(res, 200, readBlocks());
+    return true;
+  }
+
+  // A student's own status — only whether they're blocked, not the office's reason
+  if (req.url.startsWith('/api/blocks/status') && req.method === 'GET') {
+    const q = new URL(req.url, 'http://localhost').searchParams;
+    sendJson(res, 200, { blocked: Boolean(activeBlockFor(q.get('email'), q.get('regNo'))) });
+    return true;
+  }
+
+  if (req.url === '/api/blocks' && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const email = normEmail(body.email);
+    const regNo = normRegNo(body.regNo);
+    const reason = cleanText(body.reason, 500);
+    if (!email && !regNo) { sendJson(res, 400, { error: 'Enter the student\'s email or registration number.' }); return true; }
+    if (email && !IIMC_EMAIL.test(email)) { sendJson(res, 400, { error: 'The email must be an @email.iimcal.ac.in address.' }); return true; }
+    if (regNo && !/^[A-Z0-9][A-Z0-9/-]{2,39}$/.test(regNo)) { sendJson(res, 400, { error: 'That registration number doesn\'t look right (e.g. MBA/0042/62).' }); return true; }
+    if (reason.length < 5) { sendJson(res, 400, { error: 'Please give a reason (at least 5 characters). It is kept in the record.' }); return true; }
+
+    // Link every email / reg. no. this student has used, so switching one doesn't get around the block
+    const emails = new Set(email ? [email] : []);
+    const regNos = new Set(regNo ? [regNo] : []);
+    for (const r of readData().requests || []) {
+      const re = normEmail(r.studentEmail), rr = normRegNo(r.regNo);
+      if ((re && emails.has(re)) || (rr && regNos.has(rr))) {
+        if (re) emails.add(re);
+        if (rr) regNos.add(rr);
+      }
+    }
+
+    const store = readBlocks();
+    const existing = store.blocks.find(b => !b.liftedAt &&
+      ([...emails].some(e => b.emails.includes(e)) || [...regNos].some(r => b.regNos.includes(r))));
+    if (existing) { sendJson(res, 409, { error: 'This student is already deactivated.', block: existing }); return true; }
+
+    const block = {
+      id: 'BLK-' + Date.now().toString(36).toUpperCase() + '-' + crypto.randomBytes(2).toString('hex').toUpperCase(),
+      emails: [...emails],
+      regNos: [...regNos],
+      name: cleanText(body.name, 120),
+      reason,
+      blockedBy: cleanText(body.by, 200) || '—',
+      blockedAt: Date.now(),
+      liftedAt: null,
+      liftedBy: null,
+      liftNote: null,
+    };
+    store.blocks.push(block);
+    writeJsonFile(BLOCKS_FILE, store);
+    sendJson(res, 200, { block });
+    return true;
+  }
+
+  const lift = req.url.match(/^\/api\/blocks\/([A-Za-z0-9-]+)\/lift$/);
+  if (lift && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    const store = readBlocks();
+    const block = store.blocks.find(b => b.id === lift[1]);
+    if (!block) { sendJson(res, 404, { error: 'Record not found.' }); return true; }
+    if (block.liftedAt) { sendJson(res, 409, { error: 'Re-evaluation is already active again for this student.' }); return true; }
+    block.liftedAt = Date.now();
+    block.liftedBy = cleanText(body.by, 200) || '—';
+    block.liftNote = cleanText(body.note, 500) || null;
+    writeJsonFile(BLOCKS_FILE, store);
+    sendJson(res, 200, { block });
+    return true;
+  }
+
+  return false;
+}
+
+// ===== QUESTION PHOTOS =====
+// Stored under data/uploads/<request id>/ and served only through /api/photos (never as static files).
+const PHOTO_TYPES = {
+  'image/jpeg': { ext: 'jpg', magic: b => b[0] === 0xFF && b[1] === 0xD8 },
+  'image/png': { ext: 'png', magic: b => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47 },
+  'image/webp': { ext: 'webp', magic: b => b.toString('ascii', 0, 4) === 'RIFF' && b.toString('ascii', 8, 12) === 'WEBP' },
+};
+const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
+const MAX_QUESTIONS = 10;
+const MAX_PHOTOS_PER_QUESTION = 3;
+
+// "data:image/jpeg;base64,..." → { buffer, ext }, checking the bytes really are that image type
+function decodePhoto(dataUrl) {
+  const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ''));
+  if (!m) throw new Error('Photos must be JPG, PNG or WebP images.');
+  const buffer = Buffer.from(m[2], 'base64');
+  if (buffer.length > MAX_PHOTO_BYTES) throw new Error('Each photo must be under 3 MB.');
+  const type = PHOTO_TYPES[m[1]];
+  if (buffer.length < 12 || !type.magic(buffer)) throw new Error('One of the photos is not a valid image.');
+  return { buffer, ext: type.ext };
+}
+
+// The student's question number, trimmed to characters that are safe in a file name
+function photoLabel(question, index) {
+  const safe = String(question).replace(/[^A-Za-z0-9()._-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return safe || `Question ${index + 1}`;
+}
+
+// A photo is either a Drive file id or a file on this machine — the request record says which
+function findPhoto(requestId, name) {
+  const request = findRequest(readData(), requestId);
+  if (!request) return null;
+  for (const item of request.questionItems || []) {
+    for (const photo of item.photos || []) {
+      if (typeof photo === 'string' ? photo === name : photo && photo.name === name) return photo;
+    }
+  }
+  return null;
+}
+
+async function servePhoto(req, res) {
+  let urlPath;
+  try { urlPath = decodeURIComponent(req.url.split('?')[0]); }
+  catch { sendJson(res, 404, { error: 'Not Found' }); return; }
+  const m = urlPath.match(/^\/api\/photos\/([A-Za-z0-9-]{1,80})\/([A-Za-z0-9()._ -]{1,60}\.(jpg|png|webp))$/);
+  if (!m || m[2].includes('..')) { sendJson(res, 404, { error: 'Not Found' }); return; }
+
+  const photo = findPhoto(m[1], m[2]);
+  if (!photo) { sendJson(res, 404, { error: 'Not Found' }); return; }
+  const type = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' }[m[3]];
+  const headers = { 'Content-Type': type, 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600' };
+
+  if (photo.driveId) {
+    try {
+      const buffer = await drive.downloadPhoto(photo.driveId);
+      res.writeHead(200, headers);
+      res.end(buffer);
+    } catch (e) {
+      sendJson(res, 502, { error: 'Could not fetch that photo from Google Drive: ' + e.message });
+    }
+    return;
+  }
+
+  fs.readFile(path.join(UPLOADS_DIR, m[1], m[2]), (err, data) => {
+    if (err) { sendJson(res, 404, { error: 'Not Found' }); return; }
+    res.writeHead(200, headers);
+    res.end(data);
+  });
+}
+
 // POST /api/requests/submit — the only way a new request is created
 async function handleSubmitRequest(req, res) {
   try {
-    const body = await readJsonBody(req);
+    const body = await readJsonBody(req, MAX_SUBMIT_BYTES);
     const incoming = body.request || {};
     const w = readWindows().windows.find(o => o.id === incoming.windowId);
     if (!w) { sendJson(res, 400, { error: 'This re-evaluation window no longer exists.' }); return; }
@@ -514,55 +549,104 @@ async function handleSubmitRequest(req, res) {
       sendJson(res, 400, { error: `Section ${incoming.section || '—'} is not part of this re-evaluation window.` });
       return;
     }
-    const email = cleanText(incoming.studentEmail, 200).toLowerCase();
+    const email = normEmail(incoming.studentEmail);
     if (!email) { sendJson(res, 400, { error: 'Missing student email.' }); return; }
+    const regNo = cleanText(incoming.regNo, 40);
+
+    // Deactivated students can't apply, whichever email or reg. no. they use
+    if (activeBlockFor(email, regNo)) {
+      sendJson(res, 403, { error: 'Re-evaluation has been deactivated for your account. Please contact the MBA office.' });
+      return;
+    }
 
     const data = readData();
     data.requests = data.requests || [];
-    if (data.requests.some(r => r.windowId === w.id && (r.studentEmail || '').toLowerCase() === email)) {
+    if (data.requests.some(r => r.windowId === w.id && normEmail(r.studentEmail) === email)) {
       sendJson(res, 409, { error: 'You have already applied for re-evaluation in this window.' });
       return;
     }
-    // Only known fields are accepted; exam details come from the window and review fields start empty
+
+    // One entry per question: its number, the reason, and up to 3 photos
+    const items = Array.isArray(incoming.questionItems) ? incoming.questionItems : [];
+    if (!items.length) { sendJson(res, 400, { error: 'Add at least one question.' }); return; }
+    if (items.length > MAX_QUESTIONS) { sendJson(res, 400, { error: `You can list at most ${MAX_QUESTIONS} questions.` }); return; }
+    const questionItems = [];
+    const photos = [];   // [{ buffer, ext, name }]
+    const usedNames = new Set();
+    for (const [qi, item] of items.entries()) {
+      const question = cleanText(item && item.question, 40);
+      const reason = String((item && item.reason) || '').trim().slice(0, 3000);
+      if (!question || !reason) { sendJson(res, 400, { error: `Question ${qi + 1} needs both the question number and a reason.` }); return; }
+      const itemPhotos = Array.isArray(item.photos) ? item.photos : [];
+      if (itemPhotos.length > MAX_PHOTOS_PER_QUESTION) { sendJson(res, 400, { error: `Question ${qi + 1} has more than ${MAX_PHOTOS_PER_QUESTION} photos.` }); return; }
+      // Named after the question the student typed: "Q2(b) - 1.jpg", "Q2(b) - 2.jpg", …
+      const label = photoLabel(question, qi);
+      const names = [];
+      for (const [pi, dataUrl] of itemPhotos.entries()) {
+        let decoded;
+        try { decoded = decodePhoto(dataUrl); } catch (e) { sendJson(res, 400, { error: `Question ${qi + 1}: ${e.message}` }); return; }
+        let name = `${label} - ${pi + 1}.${decoded.ext}`;
+        // Two cards can carry the same question number; keep the later one distinct
+        while (usedNames.has(name)) name = `${label} (${qi + 1}) - ${pi + 1}.${decoded.ext}`;
+        usedNames.add(name);
+        photos.push({ ...decoded, name });
+        names.push(name);
+      }
+      questionItems.push({ question, reason, photos: names });
+    }
+
     const now = Date.now();
-    const text = (key, max) => cleanText(incoming[key], max);
-    const section = SECTIONS.includes(incoming.section) ? incoming.section : '';
     const request = {
       id: /^[A-Za-z0-9-]{1,60}$/.test(String(incoming.id || '')) ? incoming.id : 'IIMC-' + now.toString(36).toUpperCase(),
       windowId: w.id,
       studentEmail: email,
-      studentName: text('studentName', 120),
-      regNo: text('regNo', 40),
-      professorName: w.sections.length ? text('professorName', 120) : w.professor,
+      studentName: cleanText(incoming.studentName, 120),
+      regNo,
+      professorName: w.sections.length ? cleanText(incoming.professorName, 120) : w.professor,
       subject: w.subject,
       courseCode: w.courseCode,
-      section,
+      section: SECTIONS.includes(incoming.section) ? incoming.section : '',
       examType: w.examType,
       term: w.term,
-      questions: text('questions', 500),
-      reason: String(incoming.reason || '').trim().slice(0, 5000),
-      supportingDocs: (Array.isArray(incoming.supportingDocs) ? incoming.supportingDocs : []).slice(0, 20).map(n => cleanText(n, 200)).filter(Boolean),
-      paymentMethod: 'upi',
-      amountPaid: PAYMENT_AMOUNT_INR,
-      paymentVerified: false,   // the office confirms UPI payments against the bank statement
+      questions: questionItems.map(q => q.question).join(', '),
+      questionItems,
       status: 'Pending',
       createdAt: now,
       updatedMarks: null,
       professorRemarks: null,
       history: [{ at: now, event: 'Submitted', by: email, note: '' }],
     };
-    if (!request.studentName || !request.questions || !request.reason) {
-      sendJson(res, 400, { error: 'Name, questions and reason are required.' });
-      return;
-    }
-    if (!request.professorName) {
-      sendJson(res, 400, { error: 'No professor is assigned to this section.' });
-      return;
-    }
+    if (!request.studentName) { sendJson(res, 400, { error: 'Please enter your name.' }); return; }
+    if (!request.professorName) { sendJson(res, 400, { error: 'No professor is assigned to this section.' }); return; }
     if (data.requests.some(r => r.id === request.id)) request.id += '-' + crypto.randomBytes(2).toString('hex').toUpperCase();
 
-    data.requests.push(request);
-    saveAndArchive(data);
+    // Photos first, so a saved request never points at missing files.
+    // Google Drive when it's connected, this machine otherwise (or if Drive is unreachable).
+    const dir = path.join(UPLOADS_DIR, request.id);
+    let storedInDrive = false;
+    if (photos.length && drive.driveEnabled()) {
+      try {
+        const uploaded = await drive.uploadRequestPhotos(request, w, photos);
+        const byName = new Map(uploaded.map(p => [p.name, p.driveId]));
+        for (const item of request.questionItems) {
+          item.photos = item.photos.map(name => ({ name, driveId: byName.get(name) }));
+        }
+        storedInDrive = true;
+      } catch (e) {
+        console.error(`  ⚠️  Drive upload failed (${e.message}) — keeping the photos on this machine instead.`);
+      }
+    }
+    if (photos.length && !storedInDrive) {
+      fs.mkdirSync(dir, { recursive: true });
+      for (const p of photos) fs.writeFileSync(path.join(dir, p.name), p.buffer);
+    }
+    try {
+      data.requests.push(request);
+      saveAndArchive(data);
+    } catch (e) {
+      if (photos.length && !storedInDrive) fs.rmSync(dir, { recursive: true, force: true });
+      throw e;
+    }
     sendJson(res, 200, { request });
   } catch (e) {
     sendJson(res, 400, { error: e.message });
@@ -578,12 +662,13 @@ function saveAndArchive(data) {
   archiveRequests(data.requests);
 }
 
-// Routes: POST /api/requests/:id/review | /refund | /refund/refresh
+// POST /api/requests/:id/review — the professor's decision
+const REVIEW_STATUSES = ['Under Review', 'Resolved - Marks Increased', 'Resolved - Marks Decreased', 'Resolved - No Change'];
+
 async function handleRequestActions(req, res) {
-  const m = req.url.match(/^\/api\/requests\/([^/]+)\/(review|refund|refund\/refresh)$/);
+  const m = req.url.match(/^\/api\/requests\/([^/]+)\/review$/);
   if (!m || req.method !== 'POST') return false;
   const id = decodeURIComponent(m[1]);
-  const action = m[2];
 
   try {
     const body = await readJsonBody(req);
@@ -591,194 +676,32 @@ async function handleRequestActions(req, res) {
     const request = findRequest(data, id);
     if (!request) { sendJson(res, 404, { error: 'Request not found.' }); return true; }
 
-    if (action === 'review') {
-      const status = String(body.status || '');
-      const allowed = ['Under Review', 'Resolved - No Change', ...REFUND_STATUSES];
-      if (!allowed.includes(status)) { sendJson(res, 400, { error: 'Invalid status.' }); return true; }
-      if (!String(body.professorRemarks || '').trim()) { sendJson(res, 400, { error: 'Remarks are required.' }); return true; }
-      // A refund can't be taken back, so the decision must stay "marks changed"
-      if (isRefundActive(request.refund) && !REFUND_STATUSES.includes(status)) {
-        sendJson(res, 409, { error: 'The fee has already been refunded, so the result must stay "Marks Increased" or "Marks Decreased".' });
-        return true;
-      }
+    const status = String(body.status || '');
+    if (!REVIEW_STATUSES.includes(status)) { sendJson(res, 400, { error: 'Invalid status.' }); return true; }
+    const remarks = String(body.professorRemarks || '').trim().slice(0, 5000);
+    if (!remarks) { sendJson(res, 400, { error: 'Remarks are required.' }); return true; }
 
-      const oldStatus = request.status;
-      const by = cleanText(body.by, 200) || '—';
-      request.updatedMarks = cleanText(body.updatedMarks, 500) || null;
-      request.professorRemarks = String(body.professorRemarks).trim().slice(0, 5000);
-      request.status = status;
-      // A refund that was only due (manual) or failed no longer applies once the marks stand
-      if (!REFUND_STATUSES.includes(status) && request.refund && !isRefundActive(request.refund)) {
-        request.refund = null;
-      }
-      request.reviewedAt = Date.now();
-      request.history = Array.isArray(request.history) ? request.history : [];
-      request.history.push({
-        at: Date.now(),
-        event: oldStatus === status ? 'Remarks updated' : 'Status changed',
-        by,
-        from: oldStatus,
-        to: status,
-        note: request.professorRemarks,
-      });
-      // Save the decision first so it isn't lost if the refund call is slow or fails
-      saveAndArchive(data);
-      if (REFUND_STATUSES.includes(status)) await issueRefund(request, by);
-    }
-
-    if (action === 'refund') {
-      if (!REFUND_STATUSES.includes(request.status)) { sendJson(res, 409, { error: 'Marks did not change, so no refund is due.' }); return true; }
-      await issueRefund(request, cleanText(body.by, 200) || '—');
-    }
-
-    if (action === 'refund/refresh') {
-      if (request.refund && request.refund.id && request.refund.status === 'pending' && RAZORPAY_ENABLED) {
-        const entity = await razorpayApi('GET', `/v1/refunds/${encodeURIComponent(request.refund.id)}`);
-        const before = request.refund.status;
-        request.refund = refundFromRazorpay(entity, request.refund);
-        if (before !== request.refund.status) {
-          request.history = Array.isArray(request.history) ? request.history : [];
-          request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay', note: request.refund.id });
-        }
-      }
-    }
-
-    // Re-read so concurrent saves made during the Razorpay call aren't clobbered
-    const latest = readData();
-    const idx = latest.requests.findIndex(r => r.id === id);
-    if (idx !== -1) {
-      for (const f of REVIEW_FIELDS) latest.requests[idx][f] = request[f];
-      saveAndArchive(latest);
-    }
-    sendJson(res, 200, { request: idx !== -1 ? latest.requests[idx] : request });
+    const oldStatus = request.status;
+    const by = cleanText(body.by, 200) || '—';
+    request.updatedMarks = cleanText(body.updatedMarks, 500) || null;
+    request.professorRemarks = remarks;
+    request.status = status;
+    request.reviewedAt = Date.now();
+    request.history = Array.isArray(request.history) ? request.history : [];
+    request.history.push({
+      at: Date.now(),
+      event: oldStatus === status ? 'Remarks updated' : 'Status changed',
+      by,
+      from: oldStatus,
+      to: status,
+      note: remarks,
+    });
+    saveAndArchive(data);
+    sendJson(res, 200, { request });
   } catch (e) {
     sendJson(res, 400, { error: e.message });
   }
   return true;
-}
-
-// POST /api/razorpay/webhook — refund.processed / refund.failed (needs RAZORPAY_WEBHOOK_SECRET and a public URL)
-async function handleWebhook(req, res) {
-  if (!RAZORPAY_WEBHOOK_SECRET) { sendJson(res, 503, { error: 'Webhook secret is not configured.' }); return; }
-  const raw = await readRawBody(req);
-  const expected = crypto.createHmac('sha256', RAZORPAY_WEBHOOK_SECRET).update(raw).digest('hex');
-  const given = Buffer.from(String(req.headers['x-razorpay-signature'] || ''));
-  if (given.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(expected), given)) {
-    sendJson(res, 400, { error: 'Invalid webhook signature.' });
-    return;
-  }
-
-  let event;
-  try { event = JSON.parse(raw.toString('utf8')); } catch { sendJson(res, 400, { error: 'Bad JSON' }); return; }
-  const entity = event.payload && event.payload.refund && event.payload.refund.entity;
-  if (entity && /^refund\./.test(event.event)) {
-    const data = readData();
-    const request = data.requests.find(r => r.refund && r.refund.id === entity.id);
-    if (request) {
-      const before = request.refund.status;
-      request.refund = refundFromRazorpay(entity, request.refund);
-      if (before !== request.refund.status && request.refund.status !== 'pending') {
-        request.history = Array.isArray(request.history) ? request.history : [];
-        request.history.push({ at: Date.now(), event: request.refund.status === 'processed' ? 'Refund processed' : 'Refund failed', by: 'Razorpay webhook', note: entity.id });
-      }
-      saveAndArchive(data);
-    }
-  }
-  sendJson(res, 200, { ok: true });
-}
-
-// Pending orders created by this server process: order_id → { amount, currency }
-const pendingOrders = new Map();
-
-async function handlePaymentApi(req, res) {
-  if (req.url === '/api/payment/config' && req.method === 'GET') {
-    sendJson(res, 200, {
-      enabled: RAZORPAY_ENABLED,
-      keyId: RAZORPAY_ENABLED ? RAZORPAY_KEY_ID : null,
-      amount: PAYMENT_AMOUNT_INR,
-      currency: 'INR',
-      upi: UPI_VPA ? { vpa: UPI_VPA, payeeName: UPI_PAYEE_NAME } : null,
-    });
-    return true;
-  }
-
-  if (req.url.startsWith('/api/payment/upi/check') && req.method === 'GET') {
-    const utr = new URL(req.url, 'http://localhost').searchParams.get('utr') || '';
-    const used = (readData().requests || []).some(r => r.upiUtr && r.upiUtr === utr);
-    sendJson(res, 200, { used });
-    return true;
-  }
-
-  if (req.url === '/api/payment/order' && req.method === 'POST') {
-    if (!RAZORPAY_ENABLED) { sendJson(res, 503, { error: 'Razorpay is not configured on the server.' }); return true; }
-    try {
-      const body = await readJsonBody(req);
-      // Amount is always set server-side, in paise
-      const amount = Math.round(PAYMENT_AMOUNT_INR * 100);
-      const order = await razorpayApi('POST', '/v1/orders', {
-        amount,
-        currency: 'INR',
-        receipt: `reval_${Date.now()}`,
-        notes: {
-          studentEmail: String(body.studentEmail || '').slice(0, 256),
-          subject: String(body.subject || '').slice(0, 256),
-          questions: String(body.questions || '').slice(0, 256),
-        },
-      });
-      pendingOrders.set(order.id, { amount: order.amount, currency: order.currency });
-      sendJson(res, 200, { orderId: order.id, amount: order.amount, currency: order.currency });
-    } catch (e) {
-      sendJson(res, 502, { error: e.message });
-    }
-    return true;
-  }
-
-  if (req.url === '/api/payment/verify' && req.method === 'POST') {
-    if (!RAZORPAY_ENABLED) { sendJson(res, 503, { error: 'Razorpay is not configured on the server.' }); return true; }
-    try {
-      const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = await readJsonBody(req);
-      if (!isValidPaymentSignature(razorpay_order_id, razorpay_payment_id, razorpay_signature)) {
-        sendJson(res, 400, { verified: false, error: 'Invalid payment signature.' });
-        return true;
-      }
-      // Fall back to Razorpay if this process didn't create the order (e.g. server restarted mid-payment)
-      let order = pendingOrders.get(razorpay_order_id);
-      if (!order) {
-        const o = await razorpayApi('GET', '/v1/orders/' + encodeURIComponent(razorpay_order_id));
-        order = { amount: o.amount, currency: o.currency };
-      }
-      pendingOrders.delete(razorpay_order_id);
-
-      let payment = await razorpayApi('GET', '/v1/payments/' + encodeURIComponent(razorpay_payment_id));
-      if (payment.order_id !== razorpay_order_id || payment.amount !== order.amount) {
-        sendJson(res, 400, { verified: false, error: 'Payment does not match the order.' });
-        return true;
-      }
-      if (payment.status === 'authorized') {
-        payment = await razorpayApi('POST', '/v1/payments/' + encodeURIComponent(razorpay_payment_id) + '/capture',
-          { amount: payment.amount, currency: payment.currency });
-      }
-      if (payment.status !== 'captured') {
-        sendJson(res, 400, { verified: false, error: 'Payment is ' + payment.status + ', not captured.' });
-        return true;
-      }
-
-      const entry = {
-        orderId: razorpay_order_id,
-        paymentId: razorpay_payment_id,
-        amount: order.amount,
-        currency: order.currency,
-        verifiedAt: Date.now(),
-      };
-      recordVerifiedPayment(entry);
-      sendJson(res, 200, { verified: true, ...entry });
-    } catch (e) {
-      sendJson(res, 400, { verified: false, error: e.message });
-    }
-    return true;
-  }
-
-  return false;
 }
 
 // Only the website itself is public. Data files, the server code and config are never served.
@@ -869,7 +792,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── Review decisions and fee refunds ──
+  // ── Professor decisions ──
   if (req.url.startsWith('/api/requests/')) {
     handleRequestActions(req, res).then(handled => {
       if (!handled) sendJson(res, 404, { error: 'Not Found' });
@@ -877,17 +800,17 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── Razorpay webhook ──
-  if (req.url === '/api/razorpay/webhook' && req.method === 'POST') {
-    handleWebhook(req, res).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
+  // ── Deactivated students ──
+  if (req.url.startsWith('/api/blocks')) {
+    handleBlocks(req, res).then(handled => {
+      if (!handled) sendJson(res, 404, { error: 'Not Found' });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 400, { error: e.message }); });
     return;
   }
 
-  // ── Razorpay payment endpoints ──
-  if (req.url.startsWith('/api/payment/')) {
-    handlePaymentApi(req, res).then(handled => {
-      if (!handled) sendJson(res, 404, { error: 'Not Found' });
-    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
+  // ── Question photos ──
+  if (req.url.startsWith('/api/photos/') && req.method === 'GET') {
+    servePhoto(req, res).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
     return;
   }
 
@@ -914,9 +837,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  🌐  Open in browser: http://localhost:${PORT}`);
   console.log(`  💾  Live data:       ${DATA_FILE}`);
   console.log(`  🗄️   Archive:         ${ARCHIVE_FILE}`);
-  console.log(`  💳  Razorpay:        ${RAZORPAY_ENABLED ? 'enabled (' + RAZORPAY_KEY_ID + ')' : 'disabled — set RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET in .env'}`);
-  console.log(`  📱  UPI QR:          ${UPI_VPA ? UPI_VPA + ' — REAL money, no test mode' : 'off (set UPI_VPA in .env)'}`);
-  console.log(`  🔔  Webhook:         ${RAZORPAY_WEBHOOK_SECRET ? 'enabled at /api/razorpay/webhook' : 'off (refund status is refreshed on demand)'}`);
+  console.log(`  📷  Photos:          ${drive.driveEnabled() ? drive.driveStatus() : drive.driveStatus() + ' → ' + UPLOADS_DIR}`);
   console.log('  ⏹   Press Ctrl+C to stop the server');
   console.log('');
 });

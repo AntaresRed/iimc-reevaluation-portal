@@ -26,9 +26,8 @@
     href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Cormorant+Garamond:ital,wght@0,500;0,600;0,700;1,500;1,600&display=swap"
     rel="stylesheet" />
   <link rel="icon" type="image/png" href="assets/browser_logo.png" />
-  <link rel="stylesheet" href="css/style.css?v=6" />
+  <link rel="stylesheet" href="css/style.css?v=8" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script src="js/vendor/qrcode.min.js"></script>
 </head>
 
 <body>
@@ -124,6 +123,9 @@
         </div>
       </div>
 
+      <!-- Shown when the MBA office has deactivated re-evaluation for this student -->
+      <div class="blocked-banner" id="student-blocked-banner" style="display:none"></div>
+
       <!-- Open re-evaluation windows: the only way to raise a request -->
       <section class="open-windows" id="student-open-windows"></section>
 
@@ -184,56 +186,19 @@
             </div>
             <div class="form-group">
               <label>Questions to be Re-Evaluated *</label>
-              <input type="text" id="f-questions" placeholder="e.g. Q2(b), Q4, Q7(a)" required oninput="updateDesperationIndex()" />
+              <div class="q-list" id="q-list"></div>
+              <button type="button" class="btn-secondary btn-add-q" id="q-add-btn" onclick="addQuestionCard()">+ Add question</button>
+              <div class="section-picker-hint">One entry per question — its number, why it should be re-evaluated, and photos of that answer.</div>
               <!-- Desperation Index -->
               <div class="desperation-wrap" id="desperation-wrap" style="display:none">
                 <div class="desperation-label">🎯 Desperation Index: <span id="desperation-text">Hopeful</span></div>
                 <div class="desperation-bar"><div class="desperation-fill" id="desperation-fill"></div></div>
               </div>
             </div>
-            <div class="form-group">
-              <label>Reason for Re-Evaluation *</label>
-              <textarea id="f-reason" rows="4"
-                placeholder="Explain clearly why you believe re-evaluation is warranted for each question listed above..."
-                required></textarea>
-            </div>
-            <div class="form-group">
-              <label>Supporting Documents <span style="font-weight:400;text-transform:none;letter-spacing:0">(Optional)</span></label>
-              <div class="file-upload-area" id="docs-upload-area"
-                onclick="document.getElementById('f-docs').click()">
-                <input type="file" id="f-docs" accept="image/*,.pdf,.doc,.docx" multiple style="display:none"
-                  onchange="handleDocsUpload(this)" />
-                <div class="file-upload-content" id="docs-upload-content">
-                  <span class="file-upload-icon">🗂️</span>
-                  <p>Click to upload supporting files</p>
-                  <span class="file-upload-hint">JPG, PNG, PDF or Word • Multiple files allowed • Max 5MB each</span>
-                </div>
-              </div>
-            </div>
-            <!-- ===== PAYMENT — UPI QR ===== -->
-            <div class="form-group">
-              <label>Payment *</label>
-              <div class="upi-layout">
-                <div class="upi-qr-col">
-                  <div class="upi-qr" id="upi-qr"></div>
-                  <a class="upi-open-link" id="upi-open-link" href="#" target="_blank" rel="noopener">Open UPI app</a>
-                </div>
-                <div class="upi-details">
-                  <div class="rzp-amount" id="upi-amount">₹10</div>
-                  <div class="rzp-breakdown">Scan the QR with any UPI app and pay the re-evaluation fee before submitting.</div>
-                  <div class="upi-vpa-row">
-                    <code id="upi-vpa">—</code>
-                    <button type="button" class="btn-secondary btn-copy" onclick="copyUpiId()">Copy</button>
-                  </div>
-                  <div class="upi-note">The MBA office matches payments against the bank statement. If your marks change, the fee is refunded to the account you paid from.</div>
-                  <div class="upi-status" id="upi-status"></div>
-                </div>
-              </div>
-            </div>
             <div class="deadline-notice">
               <span>⚠️</span>
-              <span>Requests can only be submitted while the re-evaluation window is open.
-                Ensure payment of the ₹10 re-evaluation fee before submission.</span>
+              <span>Requests can only be submitted while the re-evaluation window is open. Once submitted,
+                a request cannot be edited.</span>
             </div>
             <div class="form-actions">
               <button type="button" class="btn-secondary" onclick="closeModal('student-form-modal')">Cancel</button>
@@ -366,21 +331,56 @@
           <h2 class="dashboard-title">Re-Evaluation Windows</h2>
           <p class="dashboard-subtitle">Students can only apply for re-evaluation while a window is open for their exam and section.</p>
         </div>
-        <button class="btn-primary" onclick="showWindowForm()">
-          <span>+</span> Open Re-evaluation Window
-        </button>
+        <div class="admin-header-actions">
+          <button class="btn-primary" id="admin-open-window-btn" onclick="showWindowForm()">
+            <span>+</span> Open Re-evaluation Window
+          </button>
+          <button class="btn-primary" id="admin-deactivate-btn" style="display:none" onclick="showDeactivateForm('', '', '')">
+            <span>⛔</span> Deactivate a Student
+          </button>
+        </div>
+      </div>
+
+      <div class="view-switch" id="admin-view-switch">
+        <button type="button" class="view-btn active" data-view="windows" onclick="switchAdminView('windows')">🗓️ Windows</button>
+        <button type="button" class="view-btn" data-view="students" onclick="switchAdminView('students')">🎓 Students</button>
       </div>
 
       <div class="stats-row" id="admin-stats"></div>
 
-      <div class="tab-bar">
-        <button class="tab active" onclick="switchAdminTab('open', this)">Open</button>
-        <button class="tab" onclick="switchAdminTab('scheduled', this)">Scheduled</button>
-        <button class="tab" onclick="switchAdminTab('closed', this)">Closed</button>
-        <button class="tab" onclick="switchAdminTab('all', this)">All</button>
+      <div id="admin-windows-view">
+        <div class="tab-bar">
+          <button class="tab active" onclick="switchAdminTab('open', this)">Open</button>
+          <button class="tab" onclick="switchAdminTab('scheduled', this)">Scheduled</button>
+          <button class="tab" onclick="switchAdminTab('closed', this)">Closed</button>
+          <button class="tab" onclick="switchAdminTab('all', this)">All</button>
+        </div>
+        <div class="requests-grid" id="admin-windows-grid"></div>
       </div>
 
-      <div class="requests-grid" id="admin-windows-grid"></div>
+      <div id="admin-students-view" style="display:none">
+        <div class="students-toolbar">
+          <input type="search" id="student-search" placeholder="Search by name, email or registration number…"
+            oninput="renderAdminStudents()" />
+          <span class="section-picker-hint">"Not increased" counts resolved requests where the marks stayed the same or went down.</span>
+        </div>
+        <div class="students-table-wrap">
+          <table class="students-table">
+            <thead>
+              <tr>
+                <th>Student</th>
+                <th>Registration No.</th>
+                <th class="num">Applied</th>
+                <th class="num">Not Increased</th>
+                <th>Status</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="students-tbody"></tbody>
+          </table>
+        </div>
+        <div class="blocks-log" id="blocks-log"></div>
+      </div>
     </div>
 
     <!-- Open Window Modal -->
@@ -426,8 +426,9 @@
               <div class="section-picker-hint" id="w-sections-hint">Select a subject to see its sections.</div>
             </div>
             <div class="form-group" id="w-prof-group" style="display:none">
-              <label>Reviewing Professor *</label>
-              <div class="suggest-wrap">
+              <label id="w-prof-label">Reviewing Professor *</label>
+              <div class="prof-auto" id="w-prof-auto" style="display:none"></div>
+              <div class="suggest-wrap" id="w-prof-search">
                 <input type="text" id="w-prof" autocomplete="off" placeholder="Search faculty by name or email…"
                   oninput="onProfInput()" onfocus="renderProfSuggestions()" onkeydown="onProfKeydown(event)" onblur="hideProfSuggestions()" />
                 <div class="suggest-list" id="w-prof-suggestions" hidden></div>
@@ -446,7 +447,7 @@
                   </span>
                 </div>
               </div>
-              <div class="section-picker-hint">No section is selected, so every student of this subject can apply and all requests go to this professor.</div>
+              <div class="section-picker-hint" id="w-prof-hint">No section is selected, so every student of this subject can apply and all requests go to this professor.</div>
             </div>
             <div class="form-grid-2">
               <div class="form-group">
@@ -473,6 +474,51 @@
     </div>
   </div>
 
+  <!-- Deactivate re-evaluation for a student -->
+  <div id="block-modal" class="modal-overlay">
+    <div class="modal-box">
+      <div class="modal-header">
+        <div>
+          <h3>Deactivate Re-evaluation</h3>
+          <p class="modal-sub" id="block-who"></p>
+        </div>
+        <button class="modal-close" onclick="closeModal('block-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <form id="block-form" onsubmit="submitDeactivate(event)">
+          <div class="deadline-notice">
+            <span>⚠️</span>
+            <span>The student will not be able to apply in any window, from any device, using any email or
+              registration number they have used before. Requests they have already submitted are not affected.</span>
+          </div>
+          <div class="form-grid-2">
+            <div class="form-group">
+              <label>Student Email</label>
+              <input type="text" id="b-email" maxlength="200" placeholder="name@email.iimcal.ac.in" />
+            </div>
+            <div class="form-group">
+              <label>Registration Number</label>
+              <input type="text" id="b-regno" maxlength="40" placeholder="e.g. MBA/0042/62" />
+            </div>
+          </div>
+          <div class="form-group">
+            <label>Reason *</label>
+            <textarea id="b-reason" rows="3" maxlength="500" required oninput="updateDeactivateButton()"
+              placeholder="Why is re-evaluation being switched off for this student? Kept in the record."></textarea>
+          </div>
+          <label class="checkbox-inline">
+            <input type="checkbox" id="b-confirm" onchange="updateDeactivateButton()" />
+            I confirm this student should no longer be able to apply for re-evaluation.
+          </label>
+          <div class="form-actions">
+            <button type="button" class="btn-secondary" onclick="closeModal('block-modal')">Cancel</button>
+            <button type="submit" class="btn-primary btn-danger" id="block-submit" disabled>Deactivate</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <!-- Re-evaluation window details (opened from any window card) -->
   <div id="window-detail-modal" class="modal-overlay">
     <div class="modal-box modal-wide">
@@ -490,7 +536,7 @@
   <!-- Toast -->
   <div id="toast" class="toast"></div>
 
-  <script src="js/app.js?v=6"></script>
+  <script src="js/app.js?v=8"></script>
 </body>
 
 </html>

@@ -4,13 +4,6 @@
 // to Authorized JavaScript Origins.
 const GOOGLE_CLIENT_ID = '536511739218-e3p6u17bji326mjktugahdquk9m4i0hr.apps.googleusercontent.com';
 
-// ===== CLOUDINARY CONFIG =====
-// Sign up free at https://cloudinary.com → Dashboard → copy Cloud Name
-// Then: Settings → Upload → Add upload preset → set to "Unsigned" → copy preset name
-const CLOUDINARY_CLOUD_NAME = 'doabil2m1';   // e.g. 'dxyz1234abc'
-const CLOUDINARY_UPLOAD_PRESET = 'iimc_reeval_portal'; // e.g. 'iimc_reval_unsigned'
-const CLOUDINARY_ENABLED = CLOUDINARY_CLOUD_NAME !== 'YOUR_CLOUD_NAME';
-
 // ===== PROFESSOR EMAIL DIRECTORY =====
 // Each professor has one canonical @email.iimcal.ac.in email regardless of how many subjects they teach
 const PROF_EMAILS = {
@@ -193,186 +186,207 @@ function formatDateTime(ts) {
   return new Date(ts).toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-// ===== CLOUDINARY UPLOAD =====
-async function uploadToCloudinary(file) {
-  if (!CLOUDINARY_ENABLED) return null;  // not configured — skip
-  const url = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/upload`;
-  const fd = new FormData();
-  fd.append('file', file);
-  fd.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-  fd.append('folder', 'iimc-reval');
-  const res = await fetch(url, { method: 'POST', body: fd });
-  if (!res.ok) throw new Error('Upload failed: ' + res.statusText);
-  const data = await res.json();
-  return data.secure_url;  // permanent HTTPS URL
+// ===== QUESTION CARDS =====
+// One card per question: its number, why it should be re-evaluated, and photos of that answer.
+// Photos are shrunk in the browser before upload so a phone picture doesn't weigh 8 MB.
+const MAX_QUESTIONS = 10;
+const MAX_PHOTOS_PER_QUESTION = 3;
+const PHOTO_MAX_EDGE = 1600;
+
+let _questionSeq = 0;
+const _questionPhotos = new Map();   // card id → [{ dataUrl, name }]
+
+function questionCards() {
+  return Array.from(document.querySelectorAll('#q-list .q-card'));
 }
 
-// ===== PAYMENT — UPI QR (POC) =====
-// The student scans the college UPI QR and pays the flat fee (PAYMENT_AMOUNT_INR, default ₹10).
-// UPI cannot tell this app that money arrived, so a request is recorded as "payment unconfirmed"
-// until the MBA office matches it against the bank statement. Refunds are sent back by hand.
-let _payConfig = null;    // { amount, currency, upi } from /api/payment/config
-
-function paymentAmount() {
-  return _payConfig && _payConfig.amount ? _payConfig.amount : 10;
+function renumberQuestionCards() {
+  questionCards().forEach((card, i) => {
+    card.querySelector('.q-card-title').textContent = 'Question ' + (i + 1);
+    card.querySelector('.q-remove').style.display = questionCards().length > 1 ? '' : 'none';
+  });
+  const addBtn = document.getElementById('q-add-btn');
+  if (addBtn) addBtn.disabled = questionCards().length >= MAX_QUESTIONS;
+  updateDesperationIndex();
 }
 
-function isUpiEnabled() {
-  return Boolean(_payConfig && _payConfig.upi && _payConfig.upi.vpa);
-}
-
-async function loadPaymentConfig() {
-  if (!_serverMode) return;
-  try {
-    const res = await fetch('/api/payment/config', { signal: AbortSignal.timeout(1500) });
-    if (res.ok) _payConfig = await res.json();
-  } catch { _payConfig = null; }
-}
-
-function resetPaymentSection() {
-  setUpiStatus('', '');
-  updateUpiBox();
-}
-
-// Plain UPI collect link: payee address + payee name, the format UPI apps expect
-function upiPayLink() {
-  const upi = (_payConfig && _payConfig.upi) || {};
-  const params = new URLSearchParams({ pa: upi.vpa || '', pn: upi.payeeName || 'IIM Calcutta' });
-  return 'upi://pay?' + params.toString();
-}
-
-function updateUpiBox() {
-  const amountEl = document.getElementById('upi-amount');
-  const vpaEl = document.getElementById('upi-vpa');
-  const qrEl = document.getElementById('upi-qr');
-  const linkEl = document.getElementById('upi-open-link');
-  if (!qrEl) return;
-
-  amountEl.textContent = '₹' + paymentAmount().toLocaleString('en-IN');
-
-  if (!isUpiEnabled()) {
-    vpaEl.textContent = '—';
-    qrEl.innerHTML = '<div class="upi-qr-missing">QR unavailable</div>';
-    linkEl.style.display = 'none';
-    setUpiStatus(_serverMode
-      ? 'No college UPI ID is configured. Set UPI_VPA in .env and restart the server.'
-      : 'The QR needs the portal server. Start it with start.bat and open the address it prints.', 'err');
+function addQuestionCard() {
+  const list = document.getElementById('q-list');
+  if (!list || questionCards().length >= MAX_QUESTIONS) {
+    showToast(`You can add at most ${MAX_QUESTIONS} questions.`, 'error');
     return;
   }
+  const id = 'q' + (++_questionSeq);
+  _questionPhotos.set(id, []);
 
-  const link = upiPayLink();
-  vpaEl.textContent = _payConfig.upi.vpa;
-  linkEl.href = link;
-  linkEl.style.display = '';
+  const card = document.createElement('div');
+  card.className = 'q-card';
+  card.dataset.qid = id;
+  card.innerHTML = `
+    <div class="q-card-head">
+      <span class="q-card-title">Question</span>
+      <button type="button" class="q-remove" onclick="removeQuestionCard(this)">✕ Remove</button>
+    </div>
+    <div class="form-group">
+      <label>Question number *</label>
+      <input type="text" class="q-number" maxlength="40" placeholder="e.g. Q2(b)" oninput="updateDesperationIndex()" />
+    </div>
+    <div class="form-group">
+      <label>Why should this answer be re-evaluated? *</label>
+      <textarea class="q-reason" rows="3" maxlength="3000"
+        placeholder="Explain what you believe was mis-marked in this answer."></textarea>
+    </div>
+    <div class="form-group">
+      <label>Photos of this answer <span class="label-optional">(optional, up to ${MAX_PHOTOS_PER_QUESTION})</span></label>
+      <input type="file" class="q-photos" accept="image/jpeg,image/png,image/webp" multiple hidden
+        onchange="handleQuestionPhotos(this)" />
+      <div class="q-photo-row">
+        <button type="button" class="btn-secondary btn-photo" onclick="this.closest('.q-card').querySelector('.q-photos').click()">📷 Add photos</button>
+        <span class="q-photo-hint">JPG, PNG or WebP</span>
+      </div>
+      <div class="q-thumbs"></div>
+    </div>`;
+  list.appendChild(card);
+  renumberQuestionCards();
+  card.querySelector('.q-number').focus();
+  return card;
+}
 
-  // Redraw only when the link changes (the library replaces the element's contents)
-  if (qrEl.dataset.link !== link) {
-    qrEl.innerHTML = '';
-    qrEl.dataset.link = link;
-    if (typeof QRCode === 'undefined') {
-      qrEl.innerHTML = '<div class="upi-qr-missing">QR code library did not load.<br/>Pay ' +
-        escapeHtml(_payConfig.upi.vpa) + ' manually.</div>';
-      return;
+function removeQuestionCard(btn) {
+  const card = btn.closest('.q-card');
+  _questionPhotos.delete(card.dataset.qid);
+  card.remove();
+  if (!questionCards().length) addQuestionCard();
+  renumberQuestionCards();
+}
+
+function resetQuestionCards() {
+  const list = document.getElementById('q-list');
+  if (!list) return;
+  list.innerHTML = '';
+  _questionPhotos.clear();
+  addQuestionCard();
+}
+
+// Shrink to at most 1600px on the long edge and re-encode as JPEG
+function shrinkImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.82));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('That file is not an image the browser can read.')); };
+    img.src = url;
+  });
+}
+
+async function handleQuestionPhotos(input) {
+  const card = input.closest('.q-card');
+  const id = card.dataset.qid;
+  const photos = _questionPhotos.get(id) || [];
+  const picked = Array.from(input.files || []);
+  input.value = '';   // so the same file can be chosen again after removing it
+
+  for (const file of picked) {
+    if (photos.length >= MAX_PHOTOS_PER_QUESTION) {
+      showToast(`Up to ${MAX_PHOTOS_PER_QUESTION} photos per question.`, 'error');
+      break;
     }
     try {
-      new QRCode(qrEl, { text: link, width: 168, height: 168, correctLevel: QRCode.CorrectLevel.M });
+      photos.push({ dataUrl: await shrinkImage(file), name: file.name });
     } catch (err) {
-      qrEl.innerHTML = '<div class="upi-qr-missing">Could not draw the QR code.<br/>Pay ' +
-        escapeHtml(_payConfig.upi.vpa) + ' manually.</div>';
+      showToast(`"${file.name}": ${err.message}`, 'error');
     }
   }
+  _questionPhotos.set(id, photos);
+  renderQuestionThumbs(card);
 }
 
-function setUpiStatus(msg, kind) {
-  const el = document.getElementById('upi-status');
-  if (!el) return;
-  el.textContent = msg;
-  el.className = 'upi-status' + (kind ? ' ' + kind : '');
+function renderQuestionThumbs(card) {
+  const photos = _questionPhotos.get(card.dataset.qid) || [];
+  card.querySelector('.q-thumbs').innerHTML = photos.map((p, i) => `
+    <div class="q-thumb">
+      <img src="${p.dataUrl}" alt="${escapeHtml(p.name)}" />
+      <button type="button" class="q-thumb-remove" title="Remove photo"
+        onclick="removeQuestionPhoto(this.closest('.q-card'), ${i})">✕</button>
+    </div>`).join('');
 }
 
-function copyUpiId() {
-  if (!isUpiEnabled()) return;
-  navigator.clipboard.writeText(_payConfig.upi.vpa)
-    .then(() => showToast('UPI ID copied.', 'success'))
-    .catch(() => showToast('Could not copy. The UPI ID is ' + _payConfig.upi.vpa, 'info'));
+function removeQuestionPhoto(card, index) {
+  const photos = _questionPhotos.get(card.dataset.qid) || [];
+  photos.splice(index, 1);
+  _questionPhotos.set(card.dataset.qid, photos);
+  renderQuestionThumbs(card);
 }
 
-// ===== SUBMISSION =====
-// Returns { ok, fields } for the request record. The office confirms the payment later.
-async function getPaymentForSubmission() {
-  return {
-    ok: true,
-    fields: {
-      paymentMethod: 'upi',
-      amountPaid: paymentAmount(),
-      paymentVerified: false,   // the MBA office confirms this against the bank statement
-    },
-  };
+// [{ question, reason, photos: [dataUrl] }] — or null with a message when something's missing
+function collectQuestionItems() {
+  const items = [];
+  for (const [i, card] of questionCards().entries()) {
+    const question = card.querySelector('.q-number').value.trim();
+    const reason = card.querySelector('.q-reason').value.trim();
+    if (!question) {
+      card.querySelector('.q-number').focus();
+      return { error: `Enter the question number for question ${i + 1}.` };
+    }
+    if (!reason) {
+      card.querySelector('.q-reason').focus();
+      return { error: `Enter why question ${i + 1} should be re-evaluated.` };
+    }
+    items.push({
+      question,
+      reason,
+      photos: (_questionPhotos.get(card.dataset.qid) || []).map(p => p.dataUrl),
+    });
+  }
+  if (!items.length) return { error: 'Add at least one question.' };
+  return { items };
 }
 
-// ===== FEE REFUNDS =====
-// Like the demand draft: the fee is kept if marks don't change, refunded if they go up or down.
-// The server issues refunds when the professor saves a "marks changed" decision.
-const REFUND_STATUSES = ['Resolved - Marks Increased', 'Resolved - Marks Decreased'];
+// ----- Reading questions back on the request screens -----
+// A stored photo is a plain file name, or { name, driveId } once it lives in Google Drive.
+// Either way the browser asks the portal for it — Drive ids never reach the page.
+function photoName(photo) {
+  return typeof photo === 'string' ? photo : (photo && photo.name) || '';
+}
 
+function photoUrl(requestId, photo) {
+  return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(photoName(photo))}`;
+}
+
+function questionListHtml(r) {
+  // Older requests stored one questions string and one reason for all of them
+  if (!Array.isArray(r.questionItems) || !r.questionItems.length) {
+    return `
+      <div class="detail-grid">
+        <div class="detail-item detail-full"><label>Questions</label><span>${escapeHtml(r.questions || '—')}</span></div>
+        ${r.reason ? `<div class="detail-item detail-full"><label>Reason</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>` : ''}
+      </div>`;
+  }
+  return r.questionItems.map((q, i) => `
+    <div class="q-view">
+      <div class="q-view-head">
+        <span class="q-view-num">${escapeHtml(q.question)}</span>
+        <span class="q-view-index">Question ${i + 1}</span>
+      </div>
+      <div class="q-view-reason">${escapeHtml(q.reason)}</div>
+      ${(q.photos && q.photos.length) ? `<div class="q-view-photos">${q.photos.map(photo => `
+        <a href="${photoUrl(r.id, photo)}" target="_blank" rel="noopener" title="Open full size">
+          <img src="${photoUrl(r.id, photo)}" alt="Photo of ${escapeHtml(q.question)}" loading="lazy" />
+        </a>`).join('')}</div>` : ''}
+    </div>`).join('');
+}
+
+// ===== SHARED HELPERS =====
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-// { tone, label, detail } describing what happened to this request's fee
-function getFeeState(r) {
-  const paidOnline = r.paymentMethod === 'razorpay' && r.razorpayPaymentId;
-  const amount = r.refund && r.refund.amount ? r.refund.amount / 100 : r.amountPaid;
-  // A refund that was only due or failed doesn't apply once the result is "No Change"
-  const refund = r.refund && (REFUND_STATUSES.includes(r.status) || r.refund.status === 'pending' || r.refund.status === 'processed')
-    ? r.refund : null;
-
-  if (refund && refund.status === 'processed') {
-    return { tone: 'ok', label: `Fee refunded · ₹${amount}`, detail: `Refund ${refund.id} processed${refund.processedAt ? ' on ' + formatDate(refund.processedAt) : ''}. It can take 5–7 working days to show in the bank account.` };
-  }
-  if (refund && refund.status === 'pending') {
-    return { tone: 'info', label: `Refund initiated · ₹${amount}`, detail: `Refund ${refund.id} is being processed by Razorpay. Usually 5–7 working days (UPI is often faster).` };
-  }
-  if (refund && refund.status === 'failed') {
-    return { tone: 'err', label: 'Refund failed', detail: `The refund could not be issued: ${refund.error || 'unknown error'}. The MBA office will follow up.` };
-  }
-  if (refund && refund.status === 'manual') {
-    return { tone: 'warn', label: 'Refund due (manual)', detail: refund.note };
-  }
-  if (r.status === 'Resolved - No Change') {
-    return { tone: 'muted', label: 'Fee retained', detail: 'Marks did not change, so the re-evaluation fee is kept.' };
-  }
-  if (r.paymentMethod === 'upi') {
-    return {
-      tone: r.paymentVerified ? 'muted' : 'warn',
-      label: `Fee paid by UPI · ₹${r.amountPaid}`,
-      detail: `${r.upiUtr ? 'UTR ' + r.upiUtr + '. ' : ''}${r.paymentVerified ? 'Confirmed by the MBA office.' : 'The MBA office still has to match this against the bank statement.'} If your marks change, the office refunds the fee to ${r.upiPayerVpa || 'the account you paid from'}.`,
-    };
-  }
-  if (REFUND_STATUSES.includes(r.status) && !paidOnline) {
-    return { tone: 'warn', label: 'Refund due (manual)', detail: 'Paid by receipt — the MBA office refunds this manually.' };
-  }
-  if (paidOnline) {
-    return { tone: 'muted', label: `Fee paid · ₹${r.amountPaid}`, detail: 'Refunded automatically if your marks change; kept if they don\'t.' };
-  }
-  return null;
-}
-
-function feeChip(r) {
-  const s = getFeeState(r);
-  return s ? `<span class="fee-chip fee-${s.tone}">💳 ${escapeHtml(s.label)}</span>` : '';
-}
-
-function feeDetailHtml(r) {
-  const s = getFeeState(r);
-  if (!s) return '';
-  return `
-    <div class="fee-box fee-${s.tone}">
-      <div class="fee-box-label">💳 ${escapeHtml(s.label)}</div>
-      <div class="fee-box-detail">${escapeHtml(s.detail)}</div>
-      ${r.razorpayPaymentId ? `<div class="fee-box-ids">Payment ${escapeHtml(r.razorpayPaymentId)}${r.refund && r.refund.id ? ' · Refund ' + escapeHtml(r.refund.id) : ''}</div>`
-        : r.upiUtr ? `<div class="fee-box-ids">UPI UTR ${escapeHtml(r.upiUtr)} · from ${escapeHtml(r.upiPayerVpa || '—')}</div>` : ''}
-    </div>`;
 }
 
 // Replace one request in the cache with the server's copy
@@ -394,23 +408,12 @@ async function postRequestAction(id, action, body) {
   return data.request;
 }
 
-// Pull the latest refund status from Razorpay (used when no webhook is configured)
-async function refreshRefundStatus(id) {
-  const r = getRequests().find(x => x.id === id);
-  if (!_serverMode || !r || !r.refund || r.refund.status !== 'pending') return false;
-  try {
-    const updated = await postRequestAction(id, 'refund/refresh');
-    return updated.refund.status !== 'pending';
-  } catch { return false; }
-}
-
 // ===== HISTORY TIMELINE RENDERER =====
 function renderHistoryTimeline(r) {
-  const forProfessor = currentUser && currentUser.role === 'professor';
   // Build history from the stored array; fall back to synthesised entries for legacy requests
   let entries = Array.isArray(r.history) && r.history.length > 0 ? r.history : [];
-  // Fees and refunds are handled by the MBA office — faculty don't see them
-  if (forProfessor) entries = entries.filter(e => !/^Refund /.test(e.event || ''));
+  // Old fee/refund entries are no longer part of the portal
+  entries = entries.filter(e => !/^Refund /.test(e.event || ''));
 
   if (entries.length === 0) {
     // Legacy request — synthesise from timestamps
@@ -420,8 +423,8 @@ function renderHistoryTimeline(r) {
     }
   }
 
-  const icons = { 'Submitted': '📨', 'Status changed': '🔄', 'Remarks updated': '✏️', 'Refund initiated': '💸', 'Refund processed': '✅', 'Refund failed': '⚠️' };
-  const dots = { 'Submitted': 'dot-submit', 'Status changed': 'dot-change', 'Remarks updated': 'dot-remark', 'Refund initiated': 'dot-change', 'Refund processed': 'dot-submit', 'Refund failed': 'dot-remark' };
+  const icons = { 'Submitted': '📨', 'Status changed': '🔄', 'Remarks updated': '✏️' };
+  const dots = { 'Submitted': 'dot-submit', 'Status changed': 'dot-change', 'Remarks updated': 'dot-remark' };
 
   const rows = entries.map((e, i) => {
     const isLast = i === entries.length - 1;
@@ -704,7 +707,6 @@ function studentCard(r) {
       <span class="meta-item">🏷️ Sec ${escapeHtml(r.section || '—')}</span>
     </div>
     <div class="card-questions">Questions: ${escapeHtml(r.questions)}</div>
-    ${feeChip(r)}
     <div class="card-footer">
       <span>ID: ${escapeHtml(r.id)}</span>
       <span>${formatDate(r.createdAt)}</span>
@@ -729,13 +731,6 @@ function getBadge(status) {
 function openStudentDetail(id) {
   const r = getRequests().find(x => x.id === id);
   if (!r) return;
-  // If a refund is still pending, ask Razorpay for the latest status and re-render once it changes
-  refreshRefundStatus(id).then(changed => {
-    if (changed && document.getElementById('student-detail-modal').classList.contains('open')) {
-      openStudentDetail(id);
-      renderStudentRequests(currentStudentTab);
-    }
-  });
 
   let resultHtml = '';
   if (r.updatedMarks || r.professorRemarks) {
@@ -747,13 +742,6 @@ function openStudentDetail(id) {
       ${r.professorRemarks ? `<div class="result-remarks">${escapeHtml(r.professorRemarks)}</div>` : ''}
     </div>`;
   }
-
-  const safeUrl = u => /^https:\/\//i.test(u || '') ? escapeHtml(u) : '#';
-  const docs = r.supportingDocs && r.supportingDocs.length
-    ? (r.supportingDocUrls && r.supportingDocUrls.length
-      ? r.supportingDocUrls.map((url, i) => `<a href="${safeUrl(url)}" target="_blank" rel="noopener" style="color:var(--iim-brown);text-decoration:underline">${escapeHtml(r.supportingDocs[i] || 'File ' + (i + 1))} ↗</a>`).join('')
-      : r.supportingDocs.map(n => `<span style="color:#3fb950">✓ ${escapeHtml(n)}</span>`).join(', '))
-    : '';
 
   document.getElementById('student-detail-body').innerHTML = `
     <div class="detail-section">
@@ -767,20 +755,14 @@ function openStudentDetail(id) {
         <div class="detail-item"><label>Professor</label><span>${escapeHtml(r.professorName)}</span></div>
         <div class="detail-item"><label>Term</label><span>${escapeHtml(r.term || '—')}</span></div>
         <div class="detail-item"><label>Status</label><span>${getBadge(r.status)}</span></div>
-        <div class="detail-item detail-full"><label>Questions</label><span>${escapeHtml(r.questions)}</span></div>
-        <div class="detail-item detail-full"><label>Reason for Re-Evaluation</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>
         <div class="detail-item"><label>Submitted On</label><span>${formatDate(r.createdAt)}</span></div>
         <div class="detail-item"><label>Request ID</label><span style="font-family:monospace;font-size:12px">${escapeHtml(r.id)}</span></div>
-        ${r.upiUtr ? `
-        <div class="detail-item"><label>Paid by UPI</label><span style="font-family:monospace;font-size:12px">UTR ${escapeHtml(r.upiUtr)}</span></div>
-        <div class="detail-item"><label>Refund goes to</label><span style="font-family:monospace;font-size:12px">${escapeHtml(r.upiPayerVpa || '—')}</span></div>` : ''}
-        ${!r.paymentFileName && !r.paymentUrl ? '' : `<div class="detail-item"><label>Payment Proof</label><span>${r.paymentUrl
-          ? `<a href="${safeUrl(r.paymentUrl)}" target="_blank" rel="noopener" style="color:var(--iim-brown);text-decoration:underline">View receipt ↗</a>`
-          : '<span style="color:#3fb950">✓ Uploaded (local)</span>'}</span></div>`}
-        ${docs ? `<div class="detail-item detail-full"><label>Supporting Docs</label><span style="display:flex;flex-wrap:wrap;gap:8px">${docs}</span></div>` : ''}
       </div>
     </div>
-    ${feeDetailHtml(r)}
+    <div class="detail-section">
+      <h4>Questions</h4>
+      ${questionListHtml(r)}
+    </div>
     ${resultHtml}
     ${renderHistoryTimeline(r)}`;
   openModal('student-detail-modal');
@@ -791,6 +773,7 @@ function openStudentDetail(id) {
 function showStudentForm(windowId) {
   const w = getWindows().find(x => x.id === windowId);
   if (!w || windowStateOf(w) !== 'open') { showToast('This re-evaluation window is not open.', 'error'); return false; }
+  if (_studentBlocked) { showToast('Re-evaluation is deactivated for your account. Please contact the MBA office.', 'error'); return false; }
   if (hasAppliedInWindow(w.id)) { showToast('You have already applied in this window.', 'info'); return false; }
   _formWindow = w;
 
@@ -805,33 +788,9 @@ function showStudentForm(windowId) {
   document.getElementById('f-prof').value = sectioned ? '' : (w.professor || '');
   const hint = document.getElementById('regno-hint');
   if (hint) hint.remove();
-  document.getElementById('docs-upload-content').innerHTML = `
-    <span class="file-upload-icon">🗂️</span>
-    <p>Upload answer scripts, screenshots or any supporting evidence</p>
-    <span class="file-upload-hint">JPG, PNG, PDF or Word • Multiple files • Max 5MB each</span>`;
-  document.getElementById('docs-upload-area').classList.remove('has-file');
-  resetPaymentSection();
+  resetQuestionCards();
   openModal('student-form-modal');
   return true;
-}
-
-function handleDocsUpload(input) {
-  if (input.files && input.files.length > 0) {
-    const oversized = Array.from(input.files).find(f => f.size > 5 * 1024 * 1024);
-    if (oversized) {
-      showToast(`"${oversized.name}" exceeds the 5MB limit. Please choose smaller files.`, 'error');
-      input.value = '';   // otherwise the rejected files would still be submitted
-      document.getElementById('docs-upload-area').classList.remove('has-file');
-      return;
-    }
-    const names = escapeHtml(Array.from(input.files).map(f => f.name).join(', '));
-    const totalKb = Array.from(input.files).reduce((s, f) => s + f.size, 0) / 1024;
-    document.getElementById('docs-upload-content').innerHTML = `
-      <span class="file-upload-icon">✅</span>
-      <p style="color:#3fb950;font-weight:600">${input.files.length} file${input.files.length > 1 ? 's' : ''} selected</p>
-      <span class="file-upload-hint">${names} • ${totalKb.toFixed(1)} KB total • Click to change</span>`;
-    document.getElementById('docs-upload-area').classList.add('has-file');
-  }
 }
 
 async function submitRevalForm(e) {
@@ -854,13 +813,14 @@ async function submitRevalForm(e) {
     return;
   }
 
-  const payment = await getPaymentForSubmission();
-  if (!payment.ok) return;
+  const collected = collectQuestionItems();
+  if (collected.error) { showToast(collected.error, 'error'); return; }
 
   const submitBtn = document.querySelector('#reval-form button[type="submit"]');
   const originalLabel = submitBtn.textContent;
   submitBtn.disabled = true;
-  submitBtn.textContent = 'Submitting...';
+  const photoCount = collected.items.reduce((n, q) => n + q.photos.length, 0);
+  submitBtn.textContent = photoCount ? `Uploading ${photoCount} photo${photoCount === 1 ? '' : 's'}...` : 'Submitting...';
 
   const now = Date.now();
   const request = {
@@ -875,10 +835,8 @@ async function submitRevalForm(e) {
     section,
     examType: w.examType,
     term: w.term,
-    questions: document.getElementById('f-questions').value.trim(),
-    reason: document.getElementById('f-reason').value.trim(),
-    supportingDocs: Array.from(document.getElementById('f-docs').files || []).map(f => f.name),
-    ...payment.fields,
+    questions: collected.items.map(q => q.question).join(', '),
+    questionItems: collected.items,
     status: 'Pending',
     createdAt: now,
     updatedMarks: null,
@@ -1017,16 +975,12 @@ function openProfReview(id) {
         <div class="detail-item"><label>Exam Type</label><span>${escapeHtml(r.examType)}</span></div>
         <div class="detail-item"><label>Academic Term</label><span>${escapeHtml(r.term || '—')}</span></div>
         <div class="detail-item"><label>Current Status</label><span>${getBadge(r.status)}</span></div>
-        <div class="detail-item detail-full"><label>Questions to Re-Evaluate</label><span>${escapeHtml(r.questions)}</span></div>
-        <div class="detail-item detail-full"><label>Student's Reason</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>
       </div>
+    </div>
+    <div class="detail-section">
+      <h4>Questions to Re-Evaluate</h4>
+      ${questionListHtml(r)}
     </div>`;
-
-  // A refund can't be undone, so once issued the result must stay "marks changed"
-  const refundLocked = r.refund && (r.refund.status === 'pending' || r.refund.status === 'processed');
-  Array.from(document.getElementById('p-status').options).forEach(o => {
-    o.disabled = refundLocked && !REFUND_STATUSES.includes(o.value);
-  });
 
   document.getElementById('p-marks').value = r.updatedMarks || '';
   document.getElementById('p-remarks').value = r.professorRemarks || '';
@@ -1048,12 +1002,12 @@ async function submitProfReview() {
   const status = document.getElementById('p-status').value;
   if (!remarks) { showToast('Please enter remarks/explanation.', 'error'); return; }
 
-  // Server mode: the server records the decision and issues any refund
+  // Server mode: the server records the decision
   if (_serverMode) {
     const btn = document.querySelector('#prof-review-modal .form-actions .btn-primary');
     const label = btn.textContent;
     btn.disabled = true;
-    btn.textContent = REFUND_STATUSES.includes(status) ? 'Saving & refunding...' : 'Saving...';
+    btn.textContent = 'Saving...';
     try {
       const r = await postRequestAction(currentProfRequestId, 'review', {
         status, updatedMarks: marks, professorRemarks: remarks, by: currentUser.email,
@@ -1113,7 +1067,6 @@ function loadDemoData() {
       term: 'Term 3, 2024-25',
       questions: 'Q2(b), Q4',
       reason: 'I believe Q2(b) was marked incorrectly — the formula I used yields the right answer by an alternate approach. For Q4, partial credit was not awarded for the correct methodology.',
-      paymentFileName: 'payment_receipt.pdf',
       status: 'Pending',
       createdAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
       updatedMarks: null, professorRemarks: null,
@@ -1130,7 +1083,6 @@ function loadDemoData() {
       term: 'Term 2, 2024-25',
       questions: 'Q7(a), Q7(c), Q9',
       reason: 'The demand-supply analysis in Q7 was based on the correct model discussed in class. Q9 graphical answer was accurate.',
-      paymentFileName: 'payment_proof.jpg',
       status: 'Pending',
       createdAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
       updatedMarks: null, professorRemarks: null,
@@ -1147,7 +1099,6 @@ function loadDemoData() {
       term: 'Term 3, 2024-25',
       questions: 'Q1, Q3',
       reason: 'My interpretation of Q1 aligns with the framework covered in Week 6 slides. I am requesting a re-check of Q3 as well.',
-      paymentFileName: 'receipt_scan.png',
       status: 'Under Review',
       createdAt: Date.now() - 7 * 24 * 60 * 60 * 1000,
       updatedMarks: null, professorRemarks: null,
@@ -1194,7 +1145,6 @@ window.addEventListener('DOMContentLoaded', async () => {
   await loadInitialData();
   await loadFaculty();
   await loadWindows();
-  await loadPaymentConfig();
 
   const session = localStorage.getItem('reval_session');
   if (session) {
@@ -1355,7 +1305,9 @@ function openWindowDetail(id) {
 
   let actions = '';
   if (role === 'student' && state === 'open') {
-    actions = hasAppliedInWindow(w.id)
+    actions = _studentBlocked
+      ? '<button class="btn-secondary" disabled>Re-evaluation deactivated</button>'
+      : hasAppliedInWindow(w.id)
       ? '<button class="btn-secondary" disabled>✓ Applied</button>'
       : `<button class="btn-primary" onclick="closeModal('window-detail-modal'); showStudentForm('${w.id}')">Apply for Re-evaluation</button>`;
   } else if (role === 'admin' && state !== 'closed') {
@@ -1385,6 +1337,13 @@ function openWindowDetail(id) {
 function renderStudentOpenWindows() {
   const el = document.getElementById('student-open-windows');
   if (!el || !currentUser) return;
+  const banner = document.getElementById('student-blocked-banner');
+  if (banner) {
+    banner.style.display = _studentBlocked ? '' : 'none';
+    banner.innerHTML = _studentBlocked
+      ? '<strong>Re-evaluation is deactivated for your account.</strong> Please contact the MBA office if you think this is a mistake.'
+      : '';
+  }
   const now = Date.now();
   const open = getWindows().filter(w => windowStateOf(w, now) === 'open').sort((a, b) => windowEnd(a) - windowEnd(b));
   const upcoming = getWindows().filter(w => windowStateOf(w, now) === 'scheduled').sort((a, b) => a.startsAt - b.startsAt);
@@ -1405,7 +1364,9 @@ function renderStudentOpenWindows() {
         <span class="win-countdown">⏳ Closes in ${formatTimeLeft(windowEnd(w) - now)}</span>
         ${applied
           ? '<button class="btn-secondary" disabled>✓ Applied</button>'
-          : `<button class="btn-primary" onclick="event.stopPropagation(); showStudentForm('${w.id}')">Apply</button>`}
+          : _studentBlocked
+            ? '<button class="btn-secondary" disabled title="Re-evaluation is deactivated for your account">Deactivated</button>'
+            : `<button class="btn-primary" onclick="event.stopPropagation(); showStudentForm('${w.id}')">Apply</button>`}
       </div>
     </div>`;
   }).join('');
@@ -1458,12 +1419,14 @@ function renderProfOpenWindows() {
 // ----- Admin dashboard -----
 function initAdminDashboard() {
   document.getElementById('admin-nav-user').textContent = 'Welcome, ' + currentUser.name;
-  renderAdminDashboard();
+  switchAdminView(_adminView);
+  loadBlocks().then(renderAdminDashboard);
 }
 
 function renderAdminDashboard() {
   renderAdminStats();
-  renderAdminWindows(currentAdminTab);
+  if (_adminView === 'students') renderAdminStudents();
+  else renderAdminWindows(currentAdminTab);
 }
 
 function renderAdminStats() {
@@ -1474,6 +1437,7 @@ function renderAdminStats() {
     { label: 'Scheduled', val: ws.filter(w => windowStateOf(w, now) === 'scheduled').length },
     { label: 'Closed', val: ws.filter(w => windowStateOf(w, now) === 'closed').length },
     { label: 'Requests Received', val: getRequests().filter(r => r.windowId).length },
+    { label: 'Deactivated Students', val: activeBlocks().length },
   ];
   document.getElementById('admin-stats').innerHTML = stats.map(st =>
     `<div class="stat-card"><div class="stat-number">${st.val}</div><div class="stat-label">${st.label}</div></div>`
@@ -1671,12 +1635,50 @@ function toggleAllSections() {
 // With no section ticked, the admin names the professor who reviews every request
 function updateWindowProfessorField() {
   const group = document.getElementById('w-prof-group');
-  const needed = !!document.getElementById('w-subject').value && tickedSections().length === 0;
-  group.style.display = needed ? '' : 'none';
-  document.getElementById('w-prof').required = needed;
-  if (!needed) {
+  const search = document.getElementById('w-prof-search');
+  const auto = document.getElementById('w-prof-auto');
+  const input = document.getElementById('w-prof');
+  const hasSubject = Boolean(document.getElementById('w-subject').value);
+  const sections = tickedSections();
+
+  group.style.display = hasSubject ? '' : 'none';
+  if (!hasSubject) {
     hideProfSuggestions();
     document.getElementById('w-prof-new').hidden = true;
+    return;
+  }
+
+  if (sections.length) {
+    // With sections chosen, the professors follow from the course mapping — shown, not searched
+    hideProfSuggestions();
+    document.getElementById('w-prof-new').hidden = true;
+    search.style.display = 'none';
+    auto.style.display = '';
+    input.required = false;
+
+    const subject = selectedWindowSubject();
+    const byProf = new Map();
+    sections.forEach(sec => {
+      const prof = professorFor(subject, sec) || 'Not assigned';
+      if (!byProf.has(prof)) byProf.set(prof, []);
+      byProf.get(prof).push(sec);
+    });
+    auto.innerHTML = [...byProf].map(([prof, secs]) => `
+      <div class="prof-auto-row">
+        <span class="prof-auto-name">👨‍🏫 ${escapeHtml(prof)}</span>
+        <span class="prof-auto-secs">Section${secs.length > 1 ? 's' : ''} ${secs.join(', ')}</span>
+      </div>`).join('');
+    document.getElementById('w-prof-label').textContent = byProf.size > 1 ? 'Reviewing Professors' : 'Reviewing Professor';
+    document.getElementById('w-prof-hint').textContent =
+      'From the course mapping — each section\'s requests go to that section\'s professor.';
+  } else {
+    search.style.display = '';
+    auto.style.display = 'none';
+    auto.innerHTML = '';
+    input.required = true;
+    document.getElementById('w-prof-label').textContent = 'Reviewing Professor *';
+    document.getElementById('w-prof-hint').textContent =
+      'No section is selected, so every student of this subject can apply and all requests go to this professor.';
   }
 }
 
@@ -1996,13 +1998,18 @@ function openDashboardForRole() {
   } else {
     showPage('page-student');
     initStudentDashboard();
+    // The server decides this; the page only reflects it
+    refreshBlockedState().then(renderStudentOpenWindows);
   }
 }
 
 // Every 30s: pick up windows and requests changed elsewhere, and keep countdowns current
 setInterval(async () => {
   if (!currentUser) return;
-  await Promise.all([loadWindows(), refreshRequests()]);
+  const jobs = [loadWindows(), refreshRequests()];
+  if (currentUser.role === 'admin') jobs.push(loadBlocks());
+  if (currentUser.role === 'student') jobs.push(refreshBlockedState());
+  await Promise.all(jobs);
   if (!currentUser) return;   // signed out while refreshing
   if (currentUser.role === 'admin') {
     renderAdminDashboard();
@@ -2016,6 +2023,219 @@ setInterval(async () => {
     renderStudentRequests(currentStudentTab);
   }
 }, 30000);
+
+// ===== STUDENTS AND DEACTIVATION =====
+// The office can switch re-evaluation off for a student. The server does the actual blocking
+// (matched on email and registration number, including any others the student has used), so
+// clearing the browser or signing in elsewhere changes nothing. Nothing is deleted: lifting a
+// block only records who lifted it and when.
+const NO_INCREASE_STATUSES = ['Resolved - No Change', 'Resolved - Marks Decreased'];
+
+let _blocks = [];
+let _studentBlocked = false;   // for the signed-in student
+let _adminView = 'windows';
+let _pendingBlock = null;      // student shown in the deactivate dialog
+
+function isNoIncrease(r) {
+  return NO_INCREASE_STATUSES.includes(r.status);
+}
+
+async function loadBlocks() {
+  if (!_serverMode) { _blocks = []; return; }
+  try {
+    const res = await fetch('/api/blocks', { signal: AbortSignal.timeout(3000) });
+    if (res.ok) _blocks = (await res.json()).blocks || [];
+  } catch { /* keep the previous list */ }
+}
+
+// Students only learn whether they're blocked, never the office's reason
+async function refreshBlockedState() {
+  if (!currentUser || currentUser.role !== 'student') { _studentBlocked = false; return; }
+  if (!_serverMode) {
+    _studentBlocked = false;
+    return;
+  }
+  try {
+    const res = await fetch('/api/blocks/status?email=' + encodeURIComponent(currentUser.email), { signal: AbortSignal.timeout(3000) });
+    if (res.ok) _studentBlocked = Boolean((await res.json()).blocked);
+  } catch { /* leave it as it was */ }
+}
+
+function activeBlocks() {
+  return _blocks.filter(b => !b.liftedAt);
+}
+
+function blockForStudent(email, regNo) {
+  const e = (email || '').toLowerCase();
+  const r = normaliseRegNo(regNo);
+  return activeBlocks().find(b => (e && b.emails.includes(e)) || (r && b.regNos.includes(r)));
+}
+
+// Same shape the server stores: "MBA/0042/62" and "mba/42/62" both become "MBA/42/62"
+function normaliseRegNo(value) {
+  return String(value == null ? '' : value).toUpperCase().replace(/\s+/g, '').replace(/\/0+(\d)/g, '/$1');
+}
+
+// One row per student, built from their requests plus anyone blocked without requests
+function studentRows() {
+  const rows = new Map();
+  for (const r of getRequests()) {
+    const key = (r.studentEmail || '').toLowerCase();
+    if (!key) continue;
+    if (!rows.has(key)) {
+      rows.set(key, { email: key, name: r.studentName || '—', regNo: r.regNo || '', applied: 0, noIncrease: 0, lastAt: 0 });
+    }
+    const row = rows.get(key);
+    row.applied++;
+    if (isNoIncrease(r)) row.noIncrease++;
+    if (r.createdAt > row.lastAt) { row.lastAt = r.createdAt; row.name = r.studentName || row.name; row.regNo = r.regNo || row.regNo; }
+  }
+  for (const b of activeBlocks()) {
+    for (const email of b.emails.length ? b.emails : ['—']) {
+      if (!rows.has(email)) {
+        rows.set(email, { email, name: b.name || '—', regNo: b.regNos[0] || '', applied: 0, noIncrease: 0, lastAt: b.blockedAt });
+      }
+    }
+  }
+  return [...rows.values()]
+    .map(row => ({ ...row, block: blockForStudent(row.email, row.regNo) || null }))
+    .sort((a, b) => b.noIncrease - a.noIncrease || b.applied - a.applied || a.name.localeCompare(b.name));
+}
+
+function switchAdminView(view) {
+  _adminView = view;
+  document.querySelectorAll('#admin-view-switch .view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  document.getElementById('admin-windows-view').style.display = view === 'windows' ? '' : 'none';
+  document.getElementById('admin-students-view').style.display = view === 'students' ? '' : 'none';
+  document.getElementById('admin-open-window-btn').style.display = view === 'windows' ? '' : 'none';
+  document.getElementById('admin-deactivate-btn').style.display = view === 'students' ? '' : 'none';
+  renderAdminDashboard();
+}
+
+function renderAdminStudents() {
+  const search = (document.getElementById('student-search').value || '').trim().toLowerCase();
+  const rows = studentRows().filter(row => !search ||
+    row.email.includes(search) || row.name.toLowerCase().includes(search) || row.regNo.toLowerCase().includes(search));
+
+  const body = document.getElementById('students-tbody');
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="6" class="students-empty">${search ? 'No student matches that search.' : 'No students have applied yet.'}</td></tr>`;
+  } else {
+    body.innerHTML = rows.map(row => `
+      <tr class="${row.block ? 'row-blocked' : ''}">
+        <td>
+          <div class="student-name">${escapeHtml(row.name)}</div>
+          <div class="student-email">${escapeHtml(row.email)}</div>
+        </td>
+        <td>${escapeHtml(row.regNo || '—')}</td>
+        <td class="num">${row.applied}</td>
+        <td class="num ${row.noIncrease ? 'num-alert' : ''}">${row.noIncrease}</td>
+        <td>${row.block
+          ? `<span class="win-badge badge-blocked" title="${escapeHtml(row.block.reason)}">Deactivated</span>`
+          : '<span class="win-badge badge-active">Active</span>'}</td>
+        <td>
+          ${row.block
+            ? `<button class="btn-secondary btn-end" data-id="${escapeHtml(row.block.id)}" onclick="reactivateStudent(this.dataset.id)">Reactivate</button>`
+            : `<button class="btn-secondary btn-end" data-email="${escapeHtml(row.email)}" data-reg="${escapeHtml(row.regNo)}" data-name="${escapeHtml(row.name)}"
+                 onclick="showDeactivateForm(this.dataset.email, this.dataset.reg, this.dataset.name)">Deactivate</button>`}
+        </td>
+      </tr>`).join('');
+  }
+
+  // The record: who was deactivated, why, and whether it was lifted
+  const log = document.getElementById('blocks-log');
+  if (!_blocks.length) {
+    log.innerHTML = '';
+  } else {
+    log.innerHTML = `<h4>Deactivation record</h4>` + _blocks.slice().sort((a, b) => b.blockedAt - a.blockedAt).map(b => `
+      <div class="block-row ${b.liftedAt ? 'block-lifted' : ''}">
+        <div>
+          <strong>${escapeHtml(b.emails.join(', ') || '—')}</strong>
+          ${b.regNos.length ? `<span class="block-reg">${escapeHtml(b.regNos.join(', '))}</span>` : ''}
+          <div class="block-reason">“${escapeHtml(b.reason)}”</div>
+        </div>
+        <div class="block-meta">
+          Deactivated ${formatDateTime(b.blockedAt)} by ${escapeHtml(b.blockedBy)}
+          ${b.liftedAt ? `<br/>Reactivated ${formatDateTime(b.liftedAt)} by ${escapeHtml(b.liftedBy)}${b.liftNote ? ' — ' + escapeHtml(b.liftNote) : ''}` : ''}
+        </div>
+      </div>`).join('');
+  }
+}
+
+function showDeactivateForm(email, regNo, name) {
+  _pendingBlock = { email: email || '', regNo: regNo || '', name: name || '' };
+  const known = Boolean(email || regNo);
+  document.getElementById('block-form').reset();
+  document.getElementById('b-email').value = _pendingBlock.email;
+  document.getElementById('b-regno').value = _pendingBlock.regNo;
+  document.getElementById('b-email').readOnly = known;
+  document.getElementById('b-regno').readOnly = known;
+  document.getElementById('block-who').textContent = known
+    ? `${name || email}${regNo ? ' · ' + regNo : ''}`
+    : 'Enter the student below';
+  document.getElementById('b-confirm').checked = false;
+  updateDeactivateButton();
+  openModal('block-modal');
+}
+
+function updateDeactivateButton() {
+  const reason = document.getElementById('b-reason').value.trim();
+  const confirmed = document.getElementById('b-confirm').checked;
+  document.getElementById('block-submit').disabled = reason.length < 5 || !confirmed;
+}
+
+async function submitDeactivate(e) {
+  e.preventDefault();
+  const email = document.getElementById('b-email').value.trim();
+  const regNo = document.getElementById('b-regno').value.trim();
+  const reason = document.getElementById('b-reason').value.trim();
+  if (!email && !regNo) { showToast('Enter the student\'s email or registration number.', 'error'); return; }
+  if (reason.length < 5) { showToast('Please give a reason — it is kept in the record.', 'error'); return; }
+  if (!document.getElementById('b-confirm').checked) { showToast('Please tick the confirmation box.', 'error'); return; }
+  if (!_serverMode) { showToast('Deactivating a student needs the portal server.', 'error'); return; }
+
+  const btn = document.getElementById('block-submit');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/blocks', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, regNo, reason, name: (_pendingBlock && _pendingBlock.name) || '', by: currentUser.email }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not deactivate this student');
+    _blocks.push(data.block);
+    closeModal('block-modal');
+    renderAdminDashboard();
+    showToast(`Re-evaluation deactivated for ${data.block.emails.join(', ') || data.block.regNos.join(', ')}.`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function reactivateStudent(blockId) {
+  const block = _blocks.find(b => b.id === blockId);
+  if (!block) return;
+  const who = block.emails.join(', ') || block.regNos.join(', ');
+  if (!confirm(`Turn re-evaluation back on for ${who}?\n\nThey will be able to apply again in any open window.`)) return;
+  const note = prompt('Note for the record (optional):', '') || '';
+  try {
+    const res = await fetch(`/api/blocks/${encodeURIComponent(blockId)}/lift`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ by: currentUser.email, note }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Could not reactivate');
+    Object.assign(block, data.block);
+    renderAdminDashboard();
+    showToast(`Re-evaluation reactivated for ${who}.`, 'success');
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
 
 // ===== FACULTY TEST CREDENTIALS PANEL (DEV MODE) =====
 function populateCreds() {
@@ -2174,8 +2394,8 @@ function getTermGreeting() {
 
 // ===== 6. PEACEFUL MODE TOGGLE =====
 let _peacefulMode = false;
-const PEACEFUL_LABELS = ['Total Battles', 'Awaiting Verdict', 'In The Funnel', 'Case Closed'];
-const NORMAL_LABELS = ['Total Requests', 'Pending', 'Under Review', 'Resolved'];
+const PEACEFUL_LABELS = ['Total Battles', 'Awaiting Verdict', 'In The Funnel', 'Case Closed', 'Held The Line'];
+const NORMAL_LABELS = ['Total Requests', 'Pending', 'Under Review', 'Resolved', 'Marks Not Increased'];
 
 function togglePeaceful() {
   _peacefulMode = !_peacefulMode;
@@ -2202,6 +2422,7 @@ renderStudentStats = function () {
     { label: labels[1], val: all.filter(function (r) { return r.status === 'Pending'; }).length },
     { label: labels[2], val: all.filter(function (r) { return r.status === 'Under Review'; }).length },
     { label: labels[3], val: all.filter(function (r) { return r.status.startsWith('Resolved'); }).length },
+    { label: labels[4], val: all.filter(isNoIncrease).length },
   ];
   document.getElementById('student-stats').innerHTML = stats.map(function (s) {
     return '<div class="stat-card"><div class="stat-number">' + s.val + '</div><div class="stat-label">' + s.label + '</div></div>';
@@ -2217,6 +2438,7 @@ renderProfStats = function () {
     { label: labels[1], val: all.filter(function (r) { return r.status === 'Pending'; }).length },
     { label: labels[2], val: all.filter(function (r) { return r.status === 'Under Review'; }).length },
     { label: labels[3], val: all.filter(function (r) { return r.status.startsWith('Resolved'); }).length },
+    { label: labels[4], val: all.filter(isNoIncrease).length },
   ];
   document.getElementById('prof-stats').innerHTML = stats.map(function (s) {
     return '<div class="stat-card"><div class="stat-number">' + s.val + '</div><div class="stat-label">' + s.label + '</div></div>';
@@ -2244,13 +2466,12 @@ const DESP_LEVELS = [
 ];
 
 function updateDesperationIndex() {
-  const val = (document.getElementById('f-questions') ? document.getElementById('f-questions').value : '').trim();
   const wrap = document.getElementById('desperation-wrap');
   const text = document.getElementById('desperation-text');
   const fill = document.getElementById('desperation-fill');
   if (!wrap || !text || !fill) return;
-  if (!val) { wrap.style.display = 'none'; return; }
-  const count = val.split(',').filter(function (s) { return s.trim(); }).length;
+  const count = questionCards().filter(function (c) { return c.querySelector('.q-number').value.trim(); }).length;
+  if (!count) { wrap.style.display = 'none'; return; }
   wrap.style.display = 'block';
   const lvl = DESP_LEVELS.find(function (l) { return count <= l.max; }) || DESP_LEVELS[DESP_LEVELS.length - 1];
   text.textContent = lvl.label;
