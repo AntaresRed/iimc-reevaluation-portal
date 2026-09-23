@@ -1,8 +1,18 @@
-// ===== GOOGLE OAUTH =====
-// Web client from https://console.cloud.google.com/ → APIs & Services → Credentials.
-// Its Authorized JavaScript Origins must list every address the portal is opened from:
-// https://iimc-reevaluation-portal.vercel.app, http://localhost:3001 and http://localhost.
-const GOOGLE_CLIENT_ID = '563924001571-7k30fde9qt6v7g57bsjt4ih27diikd0v.apps.googleusercontent.com';
+// ===== SUPABASE =====
+// Sign-in and (soon) all portal data. The anon key is public by design: what each signed-in
+// person may read or change is decided by the database's row level security, not by this page.
+// Google sign-in runs through Supabase (Authentication → Providers → Google).
+const SUPABASE_URL = 'https://ynunqwmrkypuvargceen.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InludW5xd21ya3lwdXZhcmdjZWVuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAxNjM5MTYsImV4cCI6MjEwNTczOTkxNn0.5L8iXBgMPGWGO9AAjqu6fDYfNdohgaEwqg5N9oAiYM8';
+
+const sb = window.supabase
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+      auth: { flowType: 'pkce', persistSession: true, autoRefreshToken: true, detectSessionInUrl: true },
+    })
+  : null;
+
+// Dev shortcuts (the [DEV] login panels) only exist when running the portal locally
+const IS_LOCAL_DEV = ['localhost', '127.0.0.1'].includes(location.hostname);
 
 // ===== PROFESSOR EMAIL DIRECTORY =====
 // Each professor has one canonical @email.iimcal.ac.in email regardless of how many subjects they teach
@@ -532,68 +542,62 @@ function onRegNoChange() {
   }
 }
 
-// ===== GOOGLE SIGN-IN =====
+// ===== SIGN-IN (Google, verified by Supabase) =====
+// Google hands the sign-in to Supabase, which checks it and returns a session. The database
+// refuses any account outside @email.iimcal.ac.in, and decides the role (admin / professor /
+// student) from its own tables — the page never gets to choose.
 const IIMC_DOMAIN = 'email.iimcal.ac.in';
 
-function initGoogleSignIn() {
-  if (typeof google === 'undefined' || !google.accounts || !google.accounts.id) return;
-  // Prefer the IIMC Google account in the chooser, and pre-select whoever last signed in on this browser
-  let lastEmail = '';
-  try { lastEmail = localStorage.getItem('reval_last_email') || ''; } catch { }
-  google.accounts.id.initialize({
-    client_id: GOOGLE_CLIENT_ID,
-    callback: handleGoogleCredential,
-    auto_select: false,
-    cancel_on_tap_outside: true,
-    hd: IIMC_DOMAIN,
-    ...(lastEmail ? { login_hint: lastEmail } : {}),
-  });
-  const btnEl = document.getElementById('google-signin-btn');
-  if (btnEl) {
-    google.accounts.id.renderButton(btnEl, {
-      theme: 'filled_black',
-      size: 'large',
-      text: 'signin_with',
-      shape: 'pill',
-      logo_alignment: 'left',
-      width: 320,
-    });
-  }
+function setAuthError(message) {
+  const el = document.getElementById('google-auth-error');
+  if (el) el.textContent = message || '';
 }
 
-function handleGoogleCredential(response) {
-  const errorEl = document.getElementById('google-auth-error');
-  if (errorEl) errorEl.textContent = '';
-  try {
-    // Decode the JWT payload (base64url → UTF-8 JSON) so names with accents or Indic scripts survive
-    const base64 = response.credential.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
-    const bytes = Uint8Array.from(atob(padded), c => c.charCodeAt(0));
-    const payload = JSON.parse(new TextDecoder().decode(bytes));
-    const email = (payload.email || '').toLowerCase();
-    const name = payload.name || email.split('@')[0];
-    const picture = payload.picture || '';
-
-    // ── Domain enforcement ──
-    if (!email.endsWith('@email.iimcal.ac.in')) {
-      if (errorEl) errorEl.textContent = 'Access restricted to @email.iimcal.ac.in accounts only. Please sign in with your IIMC Google account.';
-      google.accounts.id.disableAutoSelect();
-      return;
-    }
-
-    // ── Auto-detect role ──
-    const role = ADMIN_EMAILS.includes(email) ? 'admin' : EMAIL_TO_PROF[email] ? 'professor' : 'student';
-
-    currentUser = { email, name, role, picture };
-    localStorage.setItem('reval_session', JSON.stringify(currentUser));
-    localStorage.setItem('reval_last_email', email);
-
-    applyUserTheme();
-    openDashboardForRole();
-  } catch (err) {
-    if (errorEl) errorEl.textContent = 'Sign-in failed. Please try again.';
-    console.error('[Google Auth] Error:', err);
+async function signInWithGoogle() {
+  if (!sb) { setAuthError('Sign-in could not load. Check your internet connection and refresh.'); return; }
+  setAuthError('');
+  const btn = document.getElementById('google-signin-btn');
+  if (btn) btn.disabled = true;
+  const { error } = await sb.auth.signInWithOAuth({
+    provider: 'google',
+    options: {
+      redirectTo: location.origin + location.pathname,
+      queryParams: { hd: IIMC_DOMAIN, prompt: 'select_account' },   // show IIMC accounts first
+    },
+  });
+  if (error) {
+    if (btn) btn.disabled = false;
+    setAuthError('Sign-in failed: ' + error.message);
   }
+  // On success the browser leaves for Google and comes back here signed in
+}
+
+// Coming back from Google with an error (e.g. a non-IIMC account refused by the database)
+function takeAuthErrorFromUrl() {
+  const params = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
+  const desc = params.get('error_description');
+  if (!desc) return null;
+  history.replaceState(null, '', location.pathname);
+  const text = desc.replace(/\+/g, ' ');
+  return /database error saving new user/i.test(text)
+    ? 'Only @email.iimcal.ac.in accounts can use this portal. Please sign in with your IIMC Google account.'
+    : 'Sign-in failed: ' + text;
+}
+
+// The signed-in person as the rest of the page expects it, with the role from the database
+async function userFromSession(session) {
+  const user = session.user;
+  const meta = user.user_metadata || {};
+  const email = (user.email || '').toLowerCase();
+  const { data: role, error } = await sb.rpc('my_role');
+  if (error) console.error('[Auth] Could not read role:', error.message);
+  return {
+    email,
+    name: meta.full_name || meta.name || email.split('@')[0],
+    picture: meta.avatar_url || meta.picture || '',
+    role: error ? 'student' : role,          // the least-privileged role if the check fails
+    verified: true,
+  };
 }
 
 // Resolve canonical professor name from email (exact match)
@@ -608,9 +612,9 @@ function getProfMapEntriesForUser() {
   return PROF_MAP.filter(e => e.professor === profName);
 }
 
-function signOut() {
-  if (typeof google !== 'undefined' && google.accounts && google.accounts.id) {
-    google.accounts.id.disableAutoSelect();
+async function signOut() {
+  if (sb && currentUser && currentUser.verified) {
+    try { await sb.auth.signOut(); } catch (e) { console.error('[Auth] Sign-out:', e); }
   }
   currentUser = null;
   document.body.classList.remove('theme-sage');
@@ -1160,28 +1164,49 @@ window.addEventListener('DOMContentLoaded', async () => {
   await loadFaculty();
   await loadWindows();
 
-  const session = localStorage.getItem('reval_session');
+  const authError = takeAuthErrorFromUrl();
+  if (authError) setAuthError(authError);
+
+  // A real Google session wins. Supabase finishes the sign-in here when returning from Google.
+  let session = null;
+  if (sb) {
+    try { ({ data: { session } } = await sb.auth.getSession()); }
+    catch (e) { console.error('[Auth] Session check:', e); }
+  }
+
   if (session) {
+    currentUser = await userFromSession(session);
+    localStorage.removeItem('reval_session');           // drop any stale dev login
+    if (location.search.includes('code=')) history.replaceState(null, '', location.pathname);
+    openDashboardForRole();
+  } else if (IS_LOCAL_DEV && localStorage.getItem('reval_session')) {
+    // Dev logins are only honoured on localhost
     try {
-      currentUser = JSON.parse(session);
+      currentUser = JSON.parse(localStorage.getItem('reval_session'));
       openDashboardForRole();
     } catch { showPage('page-login'); }
   } else {
+    localStorage.removeItem('reval_session');
     showPage('page-login');
   }
 
-  // Initialize Google Sign-In (GIS may still be loading due to async — use callback too)
-  if (typeof google !== 'undefined' && google.accounts && google.accounts.id) {
-    initGoogleSignIn();
+  // Signed out in another tab, or the session expired
+  if (sb) {
+    sb.auth.onAuthStateChange((event) => {
+      if (event === 'SIGNED_OUT' && currentUser && currentUser.verified) {
+        currentUser = null;
+        showPage('page-login');
+      }
+    });
   }
 
-  // Populate dev login panels
-  populateCreds();
-  populateAdminCreds();
+  // The [DEV] login panels exist only when running locally
+  document.querySelectorAll('.creds-panel').forEach(p => { p.style.display = IS_LOCAL_DEV ? '' : 'none'; });
+  if (IS_LOCAL_DEV) {
+    populateCreds();
+    populateAdminCreds();
+  }
 });
-
-// Called by GIS library once it finishes loading (handles the async defer case)
-window.onGoogleLibraryLoad = initGoogleSignIn;
 
 // ===== RE-EVALUATION WINDOWS =====
 // Admins open a window for a subject + exam + term, optionally limited to sections, with opening and

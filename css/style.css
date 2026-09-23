@@ -1673,3 +1673,8 @@ body.theme-sage .file-upload-area.has-file {
 }
 .prof-auto-name { font-weight: 700; color: var(--text-primary); }
 .prof-auto-secs { font-size: 12px; color: var(--text-secondary); }
+
+/* Google sign-in (through Supabase) */
+#google-signin-btn { width: 100%; max-width: 320px; border-radius: 999px; }
+#google-signin-btn svg { background: #fff; border-radius: 50%; padding: 2px; width: 22px; height: 22px; }
+#google-signin-btn:disabled { opacity: 0.6; cursor: wait; transform: none; box-shadow: none; }
