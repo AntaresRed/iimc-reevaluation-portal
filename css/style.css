@@ -1571,7 +1571,28 @@ body.theme-sage .file-upload-area.has-file {
   border: 1px solid var(--border);
   transition: transform 0.15s;
 }
-.q-view-photos a:hover img { transform: scale(1.03); }
+.q-photo { padding: 0; border: none; background: none; cursor: zoom-in; line-height: 0; }
+.q-photo:hover img { transform: scale(1.03); }
+.q-photo:focus-visible img { outline: 2px solid var(--iim-gold); outline-offset: 2px; }
+
+/* Full-size photo over the page */
+.photo-viewer {
+  display: none; position: fixed; inset: 0; z-index: 2000;
+  background: rgba(0, 0, 0, 0.85);
+  padding: 32px; cursor: zoom-out;
+}
+.photo-viewer.open { display: flex; align-items: center; justify-content: center; }
+.photo-viewer img {
+  max-width: 100%; max-height: 100%;
+  object-fit: contain; border-radius: var(--radius-sm); cursor: default;
+}
+.photo-viewer-close {
+  position: absolute; top: 16px; right: 20px;
+  width: 40px; height: 40px; border: none; border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15); color: #fff;
+  font-size: 26px; line-height: 1; cursor: pointer;
+}
+.photo-viewer-close:hover { background: rgba(255, 255, 255, 0.3); }
 
 /* ===== ADMIN: VIEW SWITCH + STUDENTS ===== */
 .admin-header-actions { display: flex; gap: 10px; flex-wrap: wrap; }
@@ -1700,3 +1721,111 @@ body.theme-sage .file-upload-area.has-file {
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ===== STUDENT PROFILE ===== */
+.profile-card {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  flex-wrap: wrap;
+  background: var(--bg-card);
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-card);
+  padding: 22px 24px;
+  margin-bottom: 20px;
+}
+.profile-photo {
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  object-fit: cover;
+  border: 2px solid var(--border-gold);
+}
+.profile-initials {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, var(--iim-brown), var(--iim-brown-dark));
+  color: var(--iim-gold);
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 30px;
+  font-weight: 700;
+}
+.profile-who { flex: 1 1 240px; }
+.profile-who h3 { font-family: 'Cormorant Garamond', serif; font-size: 28px; color: var(--iim-brown); line-height: 1.2; }
+.profile-email { font-size: 13px; color: var(--text-muted); margin-top: 2px; }
+.profile-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.profile-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+.profile-fee {
+  text-align: center;
+  min-width: 140px;
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  background: var(--success-bg);
+  border: 1px solid rgba(42,122,59,0.3);
+}
+.profile-fee-count { font-size: 34px; font-weight: 800; color: var(--success); line-height: 1; }
+.profile-fee-label { font-size: 12px; color: var(--text-secondary); margin-top: 6px; }
+.profile-fee.profile-fee-due { background: var(--warning-bg); border-color: rgba(154,108,16,0.35); }
+.profile-fee.profile-fee-due .profile-fee-count { color: var(--warning); }
+.profile-note {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  background: var(--iim-cream);
+  border: 1px solid var(--border-gold);
+  border-radius: var(--radius-md);
+  padding: 12px 16px;
+  margin: 18px 0;
+}
+.profile-heading {
+  font-family: 'Cormorant Garamond', serif;
+  font-size: 22px;
+  color: var(--iim-brown);
+  margin-bottom: 12px;
+}
+.profile-history tbody tr { cursor: pointer; transition: background 0.15s; }
+.profile-history tbody tr:hover { background: var(--bg-card-hover); }
+.ph-subject { font-weight: 700; color: var(--text-primary); }
+.ph-meta { font-size: 12px; color: var(--text-muted); margin-top: 2px; }
+.ph-date { font-size: 13px; color: var(--text-secondary); white-space: nowrap; }
+.ph-outcome { font-size: 13px; font-weight: 600; }
+.ph-outcome.out-up { color: var(--success); }
+.ph-outcome.out-down { color: var(--danger); }
+.ph-outcome.out-same { color: var(--warning); }
+.ph-outcome.out-open { color: var(--text-muted); }
+.ph-fee { font-size: 13px; color: var(--text-muted); }
+.ph-fee.ph-fee-due { color: var(--warning); font-weight: 700; }
+
+/* ===== FEES REGISTER (admin) ===== */
+.fee-table .fee-caret { width: 28px; text-align: center; color: var(--text-muted); }
+.fee-table .fee-row { cursor: pointer; transition: background 0.15s; }
+.fee-table .fee-row:hover { background: var(--bg-card-hover); }
+.fee-last { font-size: 13px; color: var(--text-muted); }
+.fee-detail-row > td { padding: 0 16px 14px 44px; background: var(--bg-surface); }
+.fee-detail { width: 100%; border-collapse: collapse; }
+.fee-detail th {
+  padding: 8px 12px; text-align: left; font-size: 11px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.4px; color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+.fee-detail td { padding: 9px 12px; font-size: 13px; border-bottom: 1px solid var(--border); }
+.fee-detail tr:last-child td { border-bottom: none; }
+
+/* Photos are dropped from the student's own view once the window has closed */
+.q-view-note { margin: 10px 0 0; font-size: 13px; color: var(--text-muted); font-style: italic; }
+
+/* Photos that the 30-day sweep has already removed */
+.q-view-gone {
+  margin-top: 10px; padding: 9px 12px; font-size: 13px; color: var(--text-muted);
+  background: var(--bg-surface); border: 1px dashed var(--border); border-radius: var(--radius-sm);
+}

@@ -1,8 +1,26 @@
-# Only the website itself is deployed. These are for running the portal locally.
-server.js
-drive.js
-connect-drive.js
-start.bat
-data/
-.env
-.env.example
+# Only the website and its serverless functions are deployed.
+# Patterns are anchored with a leading slash: an unanchored "drive.js" would also match
+# api/_lib/drive.js, which the functions need.
+
+# For running the portal locally
+/server.js
+/drive.js
+/connect-drive.js
+/start.bat
+
+# Portal data: student requests, windows, faculty, deactivations and question photos
+/data/
+
+# Secrets
+/.env
+/.env.example
+
+# Database schema and seed data — includes real faculty names and addresses
+/supabase/
+
+# Editor and agent settings
+/.claude/
+
+# Repo metadata that need not be public
+/.gitignore
+/.vercelignore

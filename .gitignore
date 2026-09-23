@@ -4,3 +4,5 @@
 # Portal data: student requests, windows, faculty, deactivations and question photos.
 # Keep real people's details out of the repo.
 data/
+
+.vercel

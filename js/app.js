@@ -108,6 +108,7 @@ let currentProfTab = 'pending';
 const SERVER_API = '/api/requests';
 let _cache = [];          // in-memory request cache
 let _serverMode = false;  // true when server is reachable
+let _uploadProgress = null;   // set while a submission is uploading its photos
 
 // Sync getter — always use the cache
 function getRequests() { return _cache; }
@@ -170,11 +171,22 @@ async function submitNewRequest(request) {
     cacheRequestsLocally(_cache);
     return data.request;
   }
-  // Offline: the request (photos and all) only exists in this browser
+  // No portal server. Get the photos into Drive first so they outlive this browser,
+  // then keep the (now much smaller) request locally until requests move to Supabase.
+  let stored = 0;
+  try {
+    stored = await uploadPhotosToDrive(request, _uploadProgress);
+  } catch (e) {
+    showToast('Photos could not be stored: ' + e.message + ' They are kept on this device only.', 'error');
+  }
   const requests = getRequests();
   requests.push(request);
   saveRequests(requests);
-  showToast('Saved on this device only — the portal server was not reachable, so nothing was sent to it.', 'error');
+  if (stored) {
+    showToast(`${stored} photo${stored === 1 ? '' : 's'} saved to the portal's Drive. The request itself is still only on this device.`, 'info');
+  } else {
+    showToast('Saved on this device only — the portal server was not reachable, so nothing was sent to it.', 'error');
+  }
   return request;
 }
 
@@ -375,18 +387,123 @@ function collectQuestionItems() {
 // ----- Reading questions back on the request screens -----
 // A stored photo is a plain file name, or { name, driveId } once it lives in Google Drive.
 // Either way the browser asks the portal for it — Drive ids never reach the page.
+// ===== HOSTED PHOTO UPLOAD =====
+// With no portal server behind it, the hosted site would keep every photo as a base64 string
+// in this browser: invisible to the professor and gone the moment site data is cleared.
+// Each photo is sent to /api/photo-upload instead, which stores it in the portal's Google
+// Drive and hands back a file id. Only the id is kept in the request.
+
+// Upload endpoints need the Supabase session token; the dummy dev logins have none.
+async function supabaseAccessToken() {
+  if (!sb) return null;
+  try {
+    const { data: { session } } = await sb.auth.getSession();
+    return session ? session.access_token : null;
+  } catch { return null; }
+}
+
+async function uploadOnePhoto(token, request, name, dataUrl) {
+  const res = await fetch('/api/photo-upload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      requestId: request.id,
+      regNo: request.regNo,
+      studentName: request.studentName,
+      subject: request.subject,
+      examType: request.examType,
+      term: request.term,
+      name,
+      dataUrl,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
+  return data;
+}
+
+// Replaces every data: URL in the request with { name, driveId }. Returns how many moved.
+// Throws if the photos could not be stored, so the caller can decide what to tell the student.
+async function uploadPhotosToDrive(request, onProgress) {
+  const items = request.questionItems || [];
+  const pending = [];
+  items.forEach((q, qi) => (q.photos || []).forEach((photo, pi) => {
+    if (typeof photo === 'string' && photo.startsWith('data:image/')) pending.push({ qi, pi, dataUrl: photo });
+  }));
+  if (!pending.length) return 0;
+
+  const token = await supabaseAccessToken();
+  if (!token) throw new Error('Photos can only be uploaded when signed in with Google.');
+
+  let done = 0;
+  for (const p of pending) {
+    const label = photoLabel(items[p.qi].question, p.qi);
+    const saved = await uploadOnePhoto(token, request, `${label} - ${p.pi + 1}`, p.dataUrl);
+    items[p.qi].photos[p.pi] = { name: saved.name, driveId: saved.driveId };
+    if (saved.folderId) request.driveFolderId = saved.folderId;
+    done++;
+    if (onProgress) onProgress(done, pending.length);
+  }
+  return done;
+}
+
+// Same naming the local server uses, so a photo is called the same thing either way
+function photoLabel(question, index) {
+  const safe = String(question).replace(/[^A-Za-z0-9()._-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
+  return safe || `Question ${index + 1}`;
+}
+
 function photoName(photo) {
   return typeof photo === 'string' ? photo : (photo && photo.name) || '';
 }
 
+// ===== PHOTO VIEWER =====
+// Shows one photo full size over the page. A new tab is no good here: an offline photo is a
+// data: URL, and browsers block navigating a tab to one — that is the blank page you get.
+function openPhotoViewer(src, alt) {
+  let el = document.getElementById('photo-viewer');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'photo-viewer';
+    el.className = 'photo-viewer';
+    el.innerHTML = `
+      <button type="button" class="photo-viewer-close" title="Close" onclick="closePhotoViewer()">&times;</button>
+      <img alt="" />`;
+    el.addEventListener('click', e => { if (e.target === el) closePhotoViewer(); });
+    document.body.appendChild(el);
+  }
+  const img = el.querySelector('img');
+  img.src = src;
+  img.alt = alt || '';
+  el.classList.add('open');
+  document.addEventListener('keydown', photoViewerKeys);
+}
+
+function closePhotoViewer() {
+  const el = document.getElementById('photo-viewer');
+  if (!el) return;
+  el.classList.remove('open');
+  el.querySelector('img').src = '';      // let the browser release a large data: URL
+  document.removeEventListener('keydown', photoViewerKeys);
+}
+
+function photoViewerKeys(e) {
+  if (e.key === 'Escape') closePhotoViewer();
+}
+
 function photoUrl(requestId, photo) {
-  // Offline submissions keep the picture itself in the browser — show it directly
   const name = photoName(photo);
+  // A photo that never made it off this device is shown straight from the browser
   if (name.startsWith('data:image/')) return name;
+  // Hosted: the local server is not there to look the photo up, so fetch it from Drive by id
+  if (!_serverMode && photo && photo.driveId) {
+    const ext = (name.split('.').pop() || 'jpg').toLowerCase();
+    return `/api/photo-get?id=${encodeURIComponent(photo.driveId)}&ext=${encodeURIComponent(ext)}`;
+  }
   return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(name)}`;
 }
 
-function questionListHtml(r) {
+function questionListHtml(r, { photos = true } = {}) {
   // Older requests stored one questions string and one reason for all of them
   if (!Array.isArray(r.questionItems) || !r.questionItems.length) {
     return `
@@ -402,10 +519,12 @@ function questionListHtml(r) {
         <span class="q-view-index">Question ${i + 1}</span>
       </div>
       <div class="q-view-reason">${escapeHtml(q.reason)}</div>
-      ${(q.photos && q.photos.length) ? `<div class="q-view-photos">${q.photos.map(photo => `
-        <a href="${photoUrl(r.id, photo)}" target="_blank" rel="noopener" title="Open full size">
+      ${(photos && q.photos && q.photos.length) ? `<div class="q-view-photos">${q.photos.map(photo => `
+        <button type="button" class="q-photo" title="Open full size"
+          onclick="openPhotoViewer(this.querySelector('img').src, this.querySelector('img').alt)">
           <img src="${photoUrl(r.id, photo)}" alt="Photo of ${escapeHtml(q.question)}" loading="lazy" />
-        </a>`).join('')}</div>` : ''}
+        </button>`).join('')}</div>` : ''}
+      ${(photos && !(q.photos || []).length && q.photoCount) ? `<div class="q-view-gone">🗑️ ${q.photoCount} photo${q.photoCount === 1 ? '' : 's'} were deleted ${PHOTO_RETENTION_DAYS} days after this request was closed.</div>` : ''}
     </div>`).join('');
 }
 
@@ -664,6 +783,7 @@ function initStudentDashboard() {
   renderStudentOpenWindows();
   renderStudentStats();
   renderStudentRequests(currentStudentTab);
+  switchStudentView(_studentView);      // Requests or Profile, whichever was last open
 }
 
 function formatName(n) {
@@ -690,8 +810,15 @@ function switchStudentTab(tab, el) {
   renderStudentRequests(tab);
 }
 
+// Once its window closes, a request leaves "My Requests" and appears in the Profile history
+function isInHistory(r) {
+  const w = getWindows().find(x => x.id === r.windowId);
+  if (w) return windowStateOf(w) === 'closed';
+  return r.status.startsWith('Resolved');    // older requests with no window on record
+}
+
 function renderStudentRequests(tab) {
-  let all = getRequests().filter(r => r.studentEmail === currentUser.email);
+  let all = getRequests().filter(r => r.studentEmail === currentUser.email && !isInHistory(r));
   if (tab === 'pending') all = all.filter(r => r.status === 'Pending');
   else if (tab === 'review') all = all.filter(r => r.status === 'Under Review');
   else if (tab === 'resolved') all = all.filter(r => r.status.startsWith('Resolved'));
@@ -700,7 +827,7 @@ function renderStudentRequests(tab) {
   if (all.length === 0) {
     grid.innerHTML = `<div class="empty-state">
       <div class="empty-icon">📋</div>
-      <p>No requests in this category.</p>
+      <p>No open requests in this category. Closed ones are in your Profile.</p>
     </div>`;
     return;
   }
@@ -747,9 +874,26 @@ function getBadge(status) {
   return `<span class="badge badge-nochange">No Change</span>`;
 }
 
+// Why the photos are missing: already deleted, or simply not shown in history
+function photoNoteHtml(r, inHistory, hadPhotos) {
+  if (r.photosDeletedAt) {
+    const n = r.photoCountBeforeDeletion;
+    return `<p class="q-view-note">🗑️ ${n ? n + ' photo' + (n === 1 ? '' : 's') : 'The photos'} of your answer script
+      ${n === 1 ? 'was' : 'were'} deleted on ${formatDate(r.photosDeletedAt)}, ${PHOTO_RETENTION_DAYS} days after this
+      request was closed. Everything else about the request is kept.</p>`;
+  }
+  if (inHistory && hadPhotos) {
+    return `<p class="q-view-note">Photos are not shown once the re-evaluation window has closed. They are deleted
+      ${PHOTO_RETENTION_DAYS} days after the professor's decision.</p>`;
+  }
+  return '';
+}
+
 function openStudentDetail(id) {
   const r = getRequests().find(x => x.id === id);
   if (!r) return;
+  const inHistory = isInHistory(r);
+  const hadPhotos = (r.questionItems || []).some(q => q.photos && q.photos.length);
 
   let resultHtml = '';
   if (r.updatedMarks || r.professorRemarks) {
@@ -780,7 +924,8 @@ function openStudentDetail(id) {
     </div>
     <div class="detail-section">
       <h4>Questions</h4>
-      ${questionListHtml(r)}
+      ${questionListHtml(r, { photos: !inHistory })}
+      ${photoNoteHtml(r, inHistory, hadPhotos)}
     </div>
     ${resultHtml}
     ${renderHistoryTimeline(r)}`;
@@ -840,6 +985,8 @@ async function submitRevalForm(e) {
   submitBtn.disabled = true;
   const photoCount = collected.items.reduce((n, q) => n + q.photos.length, 0);
   submitBtn.textContent = photoCount ? `Uploading ${photoCount} photo${photoCount === 1 ? '' : 's'}...` : 'Submitting...';
+  // Photos go up one at a time, so say which one
+  _uploadProgress = (done, total) => { submitBtn.textContent = `Uploading photo ${done} of ${total}...`; };
 
   const now = Date.now();
   const request = {
@@ -869,6 +1016,7 @@ async function submitRevalForm(e) {
     showToast('Could not submit: ' + err.message, 'error');
     return;
   } finally {
+    _uploadProgress = null;
     submitBtn.disabled = false;
     submitBtn.textContent = originalLabel;
   }
@@ -1467,6 +1615,7 @@ function initAdminDashboard() {
 function renderAdminDashboard() {
   renderAdminStats();
   if (_adminView === 'students') renderAdminStudents();
+  else if (_adminView === 'fees') renderAdminFees();
   else renderAdminWindows(currentAdminTab);
 }
 
@@ -2062,23 +2211,147 @@ setInterval(async () => {
     renderStudentOpenWindows();
     renderStudentStats();
     renderStudentRequests(currentStudentTab);
+    if (_studentView === 'profile') renderStudentProfile();
   }
 }, 30000);
+
+// ===== STUDENT PROFILE =====
+// Everything the student has ever applied for, and how many times the fee is due.
+// The fee is charged only when the marks stay the same; a change either way costs nothing.
+let _studentView = 'requests';
+
+function switchStudentView(view) {
+  _studentView = view;
+  document.querySelectorAll('#student-view-switch .view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
+  document.getElementById('student-requests-view').style.display = view === 'requests' ? '' : 'none';
+  document.getElementById('student-profile-view').style.display = view === 'profile' ? '' : 'none';
+  if (view === 'profile') renderStudentProfile();
+}
+
+function myRequests() {
+  return getRequests()
+    .filter(r => (r.studentEmail || '').toLowerCase() === (currentUser.email || '').toLowerCase())
+    .sort((a, b) => b.createdAt - a.createdAt);
+}
+
+// What the student's requests add up to
+function profileSummary(all) {
+  return {
+    total: all.length,
+    pending: all.filter(r => r.status === 'Pending' || r.status === 'Under Review').length,
+    increased: all.filter(r => r.status === 'Resolved - Marks Increased').length,
+    decreased: all.filter(r => r.status === 'Resolved - Marks Decreased').length,
+    payable: all.filter(isFeePayable).length,
+  };
+}
+
+function outcomeLabel(status) {
+  if (status === 'Resolved - Marks Increased') return { text: 'Marks increased', cls: 'out-up', fee: 'No fee' };
+  if (status === 'Resolved - Marks Decreased') return { text: 'Marks decreased', cls: 'out-down', fee: 'No fee' };
+  if (status === PAYABLE_STATUS) return { text: 'No change', cls: 'out-same', fee: 'Fee payable' };
+  return { text: status, cls: 'out-open', fee: '—' };
+}
+
+function renderStudentProfile() {
+  const el = document.getElementById('student-profile-view');
+  if (!el || !currentUser) return;
+
+  const all = myRequests();
+  const s = profileSummary(all);
+  const latest = all[0];
+  const regNo = latest ? latest.regNo : '';
+  const section = getSectionFromRegNo(regNo);
+  const batch = getBatchFromEmail(currentUser.email);
+
+  const history = all.length ? all.map(r => {
+    const o = outcomeLabel(r.status);
+    const questions = Array.isArray(r.questionItems) && r.questionItems.length
+      ? r.questionItems.length : (r.questions || '').split(',').filter(q => q.trim()).length;
+    return `
+      <tr data-id="${escapeHtml(r.id)}" onclick="openStudentDetail(this.dataset.id)">
+        <td>
+          <div class="ph-subject">${escapeHtml(r.subject)}</div>
+          <div class="ph-meta">${escapeHtml(r.examType)} · ${escapeHtml(r.term || '—')}</div>
+        </td>
+        <td class="num">${questions}</td>
+        <td>${getBadge(r.status)}</td>
+        <td><span class="ph-outcome ${o.cls}">${o.text}</span></td>
+        <td class="ph-fee ${o.fee === 'Fee payable' ? 'ph-fee-due' : ''}">${o.fee}</td>
+        <td class="ph-date">${formatDate(r.createdAt)}</td>
+      </tr>`;
+  }).join('') : `<tr><td colspan="6" class="students-empty">You haven't applied for re-evaluation yet.</td></tr>`;
+
+  el.innerHTML = `
+    <div class="profile-card">
+      ${currentUser.picture ? `<img class="profile-photo" src="${escapeHtml(currentUser.picture)}" alt="" />`
+        : `<div class="profile-photo profile-initials">${escapeHtml((currentUser.name || '?').charAt(0).toUpperCase())}</div>`}
+      <div class="profile-who">
+        <h3>${escapeHtml(currentUser.name || '—')}</h3>
+        <div class="profile-email">${escapeHtml(currentUser.email)}</div>
+        <div class="profile-tags">
+          ${regNo ? `<span class="profile-tag">📋 ${escapeHtml(regNo)}</span>` : ''}
+          ${section ? `<span class="profile-tag">🏷️ Section ${section}</span>` : ''}
+          ${batch ? `<span class="profile-tag">🎓 ${escapeHtml(batch)}</span>` : ''}
+          <span class="profile-tag">${currentUser.verified ? '✅ Signed in with Google' : '🛠️ Test login'}</span>
+        </div>
+      </div>
+      <div class="profile-fee ${s.payable ? 'profile-fee-due' : ''}">
+        <div class="profile-fee-count">${s.payable}</div>
+        <div class="profile-fee-label">${s.payable === 1 ? 'time' : 'times'} the fee is payable</div>
+      </div>
+    </div>
+
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-number">${s.total}</div><div class="stat-label">Applied</div></div>
+      <div class="stat-card"><div class="stat-number">${s.pending}</div><div class="stat-label">Awaiting Result</div></div>
+      <div class="stat-card"><div class="stat-number">${s.increased}</div><div class="stat-label">Marks Increased</div></div>
+      <div class="stat-card"><div class="stat-number">${s.decreased}</div><div class="stat-label">Marks Decreased</div></div>
+      <div class="stat-card"><div class="stat-number">${s.payable}</div><div class="stat-label">No Change</div></div>
+    </div>
+
+    <div class="profile-note">
+      💡 The re-evaluation fee is charged only when your marks stay the same. If they go up
+      <em>or</em> down, you pay nothing. The MBA office collects what's due.
+    </div>
+
+    <h4 class="profile-heading">Re-evaluation history</h4>
+    <div class="students-table-wrap">
+      <table class="students-table profile-history">
+        <thead>
+          <tr>
+            <th>Subject</th>
+            <th class="num">Questions</th>
+            <th>Status</th>
+            <th>Outcome</th>
+            <th>Fee</th>
+            <th>Applied</th>
+          </tr>
+        </thead>
+        <tbody>${history}</tbody>
+      </table>
+    </div>`;
+}
 
 // ===== STUDENTS AND DEACTIVATION =====
 // The office can switch re-evaluation off for a student. The server does the actual blocking
 // (matched on email and registration number, including any others the student has used), so
 // clearing the browser or signing in elsewhere changes nothing. Nothing is deleted: lifting a
 // block only records who lifted it and when.
-const NO_INCREASE_STATUSES = ['Resolved - No Change', 'Resolved - Marks Decreased'];
+// The re-evaluation fee is charged only when the marks stay the same. A change either way
+// — up or down — costs the student nothing, exactly as the demand-draft process worked.
+const PAYABLE_STATUS = 'Resolved - No Change';
+
+// Photos of the answer script are deleted this long after the professor closes the request.
+// Kept in step with PHOTO_RETENTION_DAYS in server.js.
+const PHOTO_RETENTION_DAYS = 30;
 
 let _blocks = [];
 let _studentBlocked = false;   // for the signed-in student
 let _adminView = 'windows';
 let _pendingBlock = null;      // student shown in the deactivate dialog
 
-function isNoIncrease(r) {
-  return NO_INCREASE_STATUSES.includes(r.status);
+function isFeePayable(r) {
+  return r.status === PAYABLE_STATUS;
 }
 
 async function loadBlocks() {
@@ -2124,23 +2397,136 @@ function studentRows() {
     const key = (r.studentEmail || '').toLowerCase();
     if (!key) continue;
     if (!rows.has(key)) {
-      rows.set(key, { email: key, name: r.studentName || '—', regNo: r.regNo || '', applied: 0, noIncrease: 0, lastAt: 0 });
+      rows.set(key, { email: key, name: r.studentName || '—', regNo: r.regNo || '', applied: 0, payable: 0, lastAt: 0 });
     }
     const row = rows.get(key);
     row.applied++;
-    if (isNoIncrease(r)) row.noIncrease++;
+    if (isFeePayable(r)) row.payable++;
     if (r.createdAt > row.lastAt) { row.lastAt = r.createdAt; row.name = r.studentName || row.name; row.regNo = r.regNo || row.regNo; }
   }
   for (const b of activeBlocks()) {
     for (const email of b.emails.length ? b.emails : ['—']) {
       if (!rows.has(email)) {
-        rows.set(email, { email, name: b.name || '—', regNo: b.regNos[0] || '', applied: 0, noIncrease: 0, lastAt: b.blockedAt });
+        rows.set(email, { email, name: b.name || '—', regNo: b.regNos[0] || '', applied: 0, payable: 0, lastAt: b.blockedAt });
       }
     }
   }
   return [...rows.values()]
     .map(row => ({ ...row, block: blockForStudent(row.email, row.regNo) || null }))
-    .sort((a, b) => b.noIncrease - a.noIncrease || b.applied - a.applied || a.name.localeCompare(b.name));
+    .sort((a, b) => b.payable - a.payable || b.applied - a.applied || a.name.localeCompare(b.name));
+}
+
+// ===== FEES REGISTER =====
+// Every re-evaluation that ended with the marks unchanged, and so costs the student the fee.
+// One row per student with their count, and the individual re-evaluations behind each count.
+let _feeSearch = '';
+let _feeOpenRows = new Set();
+
+function feeRows() {
+  const rows = new Map();
+  for (const r of getRequests()) {
+    if (!isFeePayable(r)) continue;
+    const key = (r.studentEmail || '').toLowerCase();
+    if (!key) continue;
+    if (!rows.has(key)) rows.set(key, { email: key, name: r.studentName || '—', regNo: r.regNo || '', items: [] });
+    const row = rows.get(key);
+    row.items.push(r);
+    if (r.studentName) row.name = r.studentName;
+    if (r.regNo) row.regNo = r.regNo;
+  }
+  return [...rows.values()]
+    .map(row => ({ ...row, items: row.items.slice().sort((a, b) => b.createdAt - a.createdAt) }))
+    .sort((a, b) => b.items.length - a.items.length || a.name.localeCompare(b.name));
+}
+
+function setFeeSearch(value) {
+  _feeSearch = (value || '').trim().toLowerCase();
+  renderAdminFees();
+}
+
+function toggleFeeRow(email) {
+  if (_feeOpenRows.has(email)) _feeOpenRows.delete(email); else _feeOpenRows.add(email);
+  renderAdminFees();
+}
+
+function renderAdminFees() {
+  const el = document.getElementById('admin-fees-view');
+  if (!el) return;
+
+  const all = feeRows();
+  const students = all.length;
+  const charges = all.reduce((n, row) => n + row.items.length, 0);
+  const resolved = getRequests().filter(r => r.status.startsWith('Resolved')).length;
+  const share = resolved ? Math.round((charges / resolved) * 100) : 0;
+  const repeat = all.filter(row => row.items.length > 1).length;
+
+  const shown = all.filter(row => !_feeSearch ||
+    row.email.includes(_feeSearch) || row.name.toLowerCase().includes(_feeSearch) || row.regNo.toLowerCase().includes(_feeSearch));
+
+  const body = shown.length ? shown.map(row => {
+    const open = _feeOpenRows.has(row.email);
+    const detail = open ? `
+      <tr class="fee-detail-row">
+        <td colspan="5">
+          <table class="fee-detail">
+            <thead><tr><th>Subject</th><th>Exam</th><th>Term</th><th>Reviewed by</th><th>Applied</th><th>Decided</th></tr></thead>
+            <tbody>${row.items.map(r => `
+              <tr>
+                <td>${escapeHtml(r.subject)}</td>
+                <td>${escapeHtml(r.examType)}</td>
+                <td>${escapeHtml(r.term || '—')}</td>
+                <td>${escapeHtml(r.professorName || (r.professorNames || []).join(', ') || '—')}</td>
+                <td>${formatDate(r.createdAt)}</td>
+                <td>${r.reviewedAt ? formatDate(r.reviewedAt) : '—'}</td>
+              </tr>`).join('')}</tbody>
+          </table>
+        </td>
+      </tr>` : '';
+    return `
+      <tr class="fee-row" data-email="${escapeHtml(row.email)}" onclick="toggleFeeRow(this.dataset.email)">
+        <td class="fee-caret">${open ? '▾' : '▸'}</td>
+        <td>
+          <div class="student-name">${escapeHtml(row.name)}</div>
+          <div class="student-email">${escapeHtml(row.email)}</div>
+        </td>
+        <td>${escapeHtml(row.regNo || '—')}</td>
+        <td class="num num-alert">${row.items.length}</td>
+        <td class="fee-last">${formatDate(row.items[0].createdAt)}</td>
+      </tr>${detail}`;
+  }).join('')
+    : `<tr><td colspan="5" class="students-empty">${_feeSearch ? 'No student matches that search.' : 'No re-evaluation has ended without a change in marks yet.'}</td></tr>`;
+
+  el.innerHTML = `
+    <div class="stats-row">
+      <div class="stat-card"><div class="stat-number">${charges}</div><div class="stat-label">Chargeable Re-evaluations</div></div>
+      <div class="stat-card"><div class="stat-number">${students}</div><div class="stat-label">Students Who Owe</div></div>
+      <div class="stat-card"><div class="stat-number">${repeat}</div><div class="stat-label">Charged More Than Once</div></div>
+      <div class="stat-card"><div class="stat-number">${share}%</div><div class="stat-label">Of Decided Requests</div></div>
+    </div>
+
+    <div class="students-toolbar">
+      <input type="search" id="fee-search" placeholder="Search by name, email or registration number…"
+        value="${escapeHtml(_feeSearch)}" oninput="setFeeSearch(this.value)" />
+      <span class="section-picker-hint">The fee is due only when the marks stayed the same. Click a student to see each charge.</span>
+    </div>
+
+    <div class="students-table-wrap">
+      <table class="students-table fee-table">
+        <thead>
+          <tr>
+            <th class="fee-caret"></th>
+            <th>Student</th>
+            <th>Registration No.</th>
+            <th class="num">Times Charged</th>
+            <th>Latest</th>
+          </tr>
+        </thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>`;
+
+  const search = document.getElementById('fee-search');
+  if (search && _feeSearch) { search.focus(); search.setSelectionRange(search.value.length, search.value.length); }
 }
 
 function switchAdminView(view) {
@@ -2148,6 +2534,16 @@ function switchAdminView(view) {
   document.querySelectorAll('#admin-view-switch .view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   document.getElementById('admin-windows-view').style.display = view === 'windows' ? '' : 'none';
   document.getElementById('admin-students-view').style.display = view === 'students' ? '' : 'none';
+  document.getElementById('admin-fees-view').style.display = view === 'fees' ? '' : 'none';
+  // The window counters belong to the windows and students views; the fees view brings its own
+  document.getElementById('admin-stats').style.display = view === 'fees' ? 'none' : '';
+  const heading = {
+    windows: ['Re-Evaluation Windows', 'Students can only apply for re-evaluation while a window is open for their exam and section.'],
+    students: ['Students', 'Everyone who has applied, what they owe, and who is currently deactivated.'],
+    fees: ['Fees Register', 'Every re-evaluation that ended with the marks unchanged — those are the ones the student pays for.'],
+  }[view];
+  document.getElementById('admin-title').textContent = heading[0];
+  document.getElementById('admin-subtitle').textContent = heading[1];
   document.getElementById('admin-open-window-btn').style.display = view === 'windows' ? '' : 'none';
   document.getElementById('admin-deactivate-btn').style.display = view === 'students' ? '' : 'none';
   renderAdminDashboard();
@@ -2170,7 +2566,7 @@ function renderAdminStudents() {
         </td>
         <td>${escapeHtml(row.regNo || '—')}</td>
         <td class="num">${row.applied}</td>
-        <td class="num ${row.noIncrease ? 'num-alert' : ''}">${row.noIncrease}</td>
+        <td class="num ${row.payable ? 'num-alert' : ''}">${row.payable}</td>
         <td>${row.block
           ? `<span class="win-badge badge-blocked" title="${escapeHtml(row.block.reason)}">Deactivated</span>`
           : '<span class="win-badge badge-active">Active</span>'}</td>
@@ -2435,8 +2831,8 @@ function getTermGreeting() {
 
 // ===== 6. PEACEFUL MODE TOGGLE =====
 let _peacefulMode = false;
-const PEACEFUL_LABELS = ['Total Battles', 'Awaiting Verdict', 'In The Funnel', 'Case Closed', 'Held The Line'];
-const NORMAL_LABELS = ['Total Requests', 'Pending', 'Under Review', 'Resolved', 'Marks Not Increased'];
+const PEACEFUL_LABELS = ['Total Battles', 'Awaiting Verdict', 'In The Funnel', 'Case Closed', 'Paid The Price'];
+const NORMAL_LABELS = ['Total Requests', 'Pending', 'Under Review', 'Resolved', 'Fee Payable'];
 
 function togglePeaceful() {
   _peacefulMode = !_peacefulMode;
@@ -2463,7 +2859,7 @@ renderStudentStats = function () {
     { label: labels[1], val: all.filter(function (r) { return r.status === 'Pending'; }).length },
     { label: labels[2], val: all.filter(function (r) { return r.status === 'Under Review'; }).length },
     { label: labels[3], val: all.filter(function (r) { return r.status.startsWith('Resolved'); }).length },
-    { label: labels[4], val: all.filter(isNoIncrease).length },
+    { label: labels[4], val: all.filter(isFeePayable).length },
   ];
   document.getElementById('student-stats').innerHTML = stats.map(function (s) {
     return '<div class="stat-card"><div class="stat-number">' + s.val + '</div><div class="stat-label">' + s.label + '</div></div>';
@@ -2478,8 +2874,8 @@ renderProfStats = function () {
     { label: labels[0], val: all.length },
     { label: labels[1], val: all.filter(function (r) { return r.status === 'Pending'; }).length },
     { label: labels[2], val: all.filter(function (r) { return r.status === 'Under Review'; }).length },
+    // No fee counter here: what a student owes the office is not the professor's business
     { label: labels[3], val: all.filter(function (r) { return r.status.startsWith('Resolved'); }).length },
-    { label: labels[4], val: all.filter(isNoIncrease).length },
   ];
   document.getElementById('prof-stats').innerHTML = stats.map(function (s) {
     return '<div class="stat-card"><div class="stat-number">' + s.val + '</div><div class="stat-label">' + s.label + '</div></div>';

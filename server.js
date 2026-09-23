@@ -627,10 +627,11 @@ async function handleSubmitRequest(req, res) {
     if (photos.length && drive.driveEnabled()) {
       try {
         const uploaded = await drive.uploadRequestPhotos(request, w, photos);
-        const byName = new Map(uploaded.map(p => [p.name, p.driveId]));
+        const byName = new Map(uploaded.photos.map(p => [p.name, p.driveId]));
         for (const item of request.questionItems) {
           item.photos = item.photos.map(name => ({ name, driveId: byName.get(name) }));
         }
+        request.driveFolderId = uploaded.folderId;   // so the photos can be cleaned up later without guessing
         storedInDrive = true;
       } catch (e) {
         console.error(`  ⚠️  Drive upload failed (${e.message}) — keeping the photos on this machine instead.`);
@@ -651,6 +652,117 @@ async function handleSubmitRequest(req, res) {
   } catch (e) {
     sendJson(res, 400, { error: e.message });
   }
+}
+
+// ===== PHOTO RETENTION =====
+// Answer scripts are evidence for the professor's decision, not a permanent archive. Thirty days
+// after a request is closed the photos are deleted — from Drive if that is where they went, from
+// this machine otherwise. Everything else about the request is kept: questions, reasons, the
+// decision and the timeline all survive, so the record stays complete without the storage.
+const PHOTO_RETENTION_DAYS = Number(process.env.PHOTO_RETENTION_DAYS || 30);
+const RETENTION_MS = PHOTO_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+const SWEEP_EVERY_MS = 7 * 24 * 60 * 60 * 1000;
+
+function photoCountOf(request) {
+  return (request.questionItems || []).reduce((n, q) => n + ((q.photos || []).length), 0);
+}
+
+// Closed long enough, still holding photos, not already swept
+function isPhotoExpired(request, now = Date.now()) {
+  if (request.photosDeletedAt) return false;
+  if (!String(request.status || '').startsWith('Resolved')) return false;
+  const closedAt = request.resolvedAt || request.reviewedAt;
+  if (!closedAt || now - closedAt < RETENTION_MS) return false;
+  return photoCountOf(request) > 0;
+}
+
+// Delete one request's photos. Returns how many went. Throws without touching the request if
+// Drive is unreachable, so the next sweep tries again rather than orphaning the files.
+async function deletePhotosOf(request) {
+  const items = request.questionItems || [];
+  const driveIds = [];
+  for (const item of items) {
+    for (const photo of item.photos || []) {
+      if (photo && typeof photo === 'object' && photo.driveId) driveIds.push(photo.driveId);
+    }
+  }
+
+  if (driveIds.length) {
+    if (!drive.driveEnabled()) throw new Error('Drive is not connected, so its photos cannot be deleted yet.');
+    for (const id of driveIds) await drive.deletePhoto(id);
+    if (request.driveFolderId) {
+      try { await drive.deleteFolderIfEmpty(request.driveFolderId); }
+      catch (e) { console.error(`  ⚠️  Could not remove the Drive folder for ${request.id}: ${e.message}`); }
+    }
+  }
+  fs.rmSync(path.join(UPLOADS_DIR, request.id), { recursive: true, force: true });
+
+  const count = photoCountOf(request);
+  for (const item of items) {
+    item.photoCount = (item.photos || []).length;   // what was there, for the record
+    item.photos = [];
+  }
+  request.photosDeletedAt = Date.now();
+  request.photoCountBeforeDeletion = count;
+  request.history = Array.isArray(request.history) ? request.history : [];
+  request.history.push({
+    at: Date.now(),
+    event: 'Photos deleted',
+    by: 'Portal',
+    from: `${count} photo${count === 1 ? '' : 's'}`,
+    to: 'deleted',
+    note: `Removed automatically ${PHOTO_RETENTION_DAYS} days after the request was closed.`,
+  });
+  return count;
+}
+
+let _sweeping = false;
+
+async function sweepExpiredPhotos() {
+  if (_sweeping) return { skipped: true, requests: 0, photos: 0, failed: 0 };
+  _sweeping = true;
+  const result = { requests: 0, photos: 0, failed: 0 };
+  try {
+    const data = readData();
+    const due = (data.requests || []).filter(r => isPhotoExpired(r));
+    if (!due.length) return result;
+
+    for (const request of due) {
+      try {
+        result.photos += await deletePhotosOf(request);
+        result.requests++;
+      } catch (e) {
+        result.failed++;
+        console.error(`  ⚠️  Could not delete the photos for ${request.id}: ${e.message}`);
+      }
+    }
+    if (result.requests) {
+      saveAndArchive(data);
+      console.log(`  🧹  Deleted ${result.photos} photo(s) from ${result.requests} request(s) closed over ${PHOTO_RETENTION_DAYS} days ago.`);
+    }
+  } catch (e) {
+    console.error('  ⚠️  Photo sweep failed:', e.message);
+  } finally {
+    _sweeping = false;
+  }
+  return result;
+}
+
+// POST /api/maintenance/sweep-photos — run the sweep now.
+// Only from this machine, or with the key from MAINTENANCE_KEY (for a hosted cron later).
+async function handleMaintenance(req, res) {
+  if (req.url !== '/api/maintenance/sweep-photos' || req.method !== 'POST') return false;
+  const key = process.env.MAINTENANCE_KEY || '';
+  const given = String(req.headers['x-maintenance-key'] || '');
+  const local = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+  const allowed = key
+    ? given.length === key.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(key))
+    : local;
+  if (!allowed) { sendJson(res, 403, { error: 'Not allowed.' }); return true; }
+
+  const result = await sweepExpiredPhotos();
+  sendJson(res, 200, { retentionDays: PHOTO_RETENTION_DAYS, ...result });
+  return true;
 }
 
 function findRequest(data, id) {
@@ -687,6 +799,10 @@ async function handleRequestActions(req, res) {
     request.professorRemarks = remarks;
     request.status = status;
     request.reviewedAt = Date.now();
+    // The retention clock starts when the professor closes the request, not when they first open it.
+    // Reopening a request clears it, so a later decision starts the 30 days again.
+    if (status.startsWith('Resolved')) { if (!request.resolvedAt) request.resolvedAt = Date.now(); }
+    else request.resolvedAt = null;
     request.history = Array.isArray(request.history) ? request.history : [];
     request.history.push({
       at: Date.now(),
@@ -808,6 +924,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── Housekeeping ──
+  if (req.url.startsWith('/api/maintenance/')) {
+    handleMaintenance(req, res).then(handled => {
+      if (!handled) sendJson(res, 404, { error: 'Not Found' });
+    }).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
+    return;
+  }
+
   // ── Question photos ──
   if (req.url.startsWith('/api/photos/') && req.method === 'GET') {
     servePhoto(req, res).catch(e => { if (!res.headersSent) sendJson(res, 500, { error: e.message }); });
@@ -838,6 +962,11 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`  💾  Live data:       ${DATA_FILE}`);
   console.log(`  🗄️   Archive:         ${ARCHIVE_FILE}`);
   console.log(`  📷  Photos:          ${drive.driveEnabled() ? drive.driveStatus() : drive.driveStatus() + ' → ' + UPLOADS_DIR}`);
+  console.log(`  🧹  Photo retention: deleted ${PHOTO_RETENTION_DAYS} days after a request is closed`);
   console.log('  ⏹   Press Ctrl+C to stop the server');
   console.log('');
+
+  // Sweep on start-up and once a week. unref() so the timer never holds the process open.
+  sweepExpiredPhotos();
+  setInterval(sweepExpiredPhotos, SWEEP_EVERY_MS).unref();
 });
