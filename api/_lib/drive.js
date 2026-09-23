@@ -11,11 +11,12 @@
 
 const https = require('https');
 const { URLSearchParams } = require('url');
+const { envValue, assertHeaderSafe } = require('./env.js');
 
-const CLIENT_ID = process.env.GDRIVE_CLIENT_ID || '';
-const CLIENT_SECRET = process.env.GDRIVE_CLIENT_SECRET || '';
-const REFRESH_TOKEN = process.env.GDRIVE_REFRESH_TOKEN || '';
-const ROOT_FOLDER_ID = process.env.GDRIVE_ROOT_FOLDER_ID || '';
+const CLIENT_ID = assertHeaderSafe('GDRIVE_CLIENT_ID', envValue('GDRIVE_CLIENT_ID'));
+const CLIENT_SECRET = assertHeaderSafe('GDRIVE_CLIENT_SECRET', envValue('GDRIVE_CLIENT_SECRET'));
+const REFRESH_TOKEN = assertHeaderSafe('GDRIVE_REFRESH_TOKEN', envValue('GDRIVE_REFRESH_TOKEN'));
+const ROOT_FOLDER_ID = assertHeaderSafe('GDRIVE_ROOT_FOLDER_ID', envValue('GDRIVE_ROOT_FOLDER_ID'));
 
 // Only files this app creates — the portal can never read the rest of the Drive
 const SCOPE = 'https://www.googleapis.com/auth/drive.file';

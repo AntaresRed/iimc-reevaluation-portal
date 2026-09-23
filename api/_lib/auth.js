@@ -8,10 +8,11 @@
  */
 
 const https = require('https');
+const { envValue, assertHeaderSafe } = require('./env.js');
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://ynunqwmrkypuvargceen.supabase.co';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
-const ALLOWED_DOMAIN = process.env.ALLOWED_EMAIL_DOMAIN || 'email.iimcal.ac.in';
+const SUPABASE_URL = envValue('SUPABASE_URL', 'https://ynunqwmrkypuvargceen.supabase.co');
+const SUPABASE_ANON_KEY = envValue('SUPABASE_ANON_KEY');
+const ALLOWED_DOMAIN = envValue('ALLOWED_EMAIL_DOMAIN', 'email.iimcal.ac.in');
 
 function getJson(url, headers) {
   return new Promise((resolve, reject) => {
@@ -55,8 +56,8 @@ async function requireUser(req) {
   }
 
   const res = await getJson(`${SUPABASE_URL}/auth/v1/user`, {
-    apikey: SUPABASE_ANON_KEY,
-    Authorization: `Bearer ${token}`,
+    apikey: assertHeaderSafe('SUPABASE_ANON_KEY', SUPABASE_ANON_KEY),
+    Authorization: `Bearer ${assertHeaderSafe('the sign-in token', token.replace(/\s+/g, ''))}`,
   });
 
   if (res.status !== 200 || !res.body || !res.body.email) {
