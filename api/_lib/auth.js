@@ -8,10 +8,28 @@
  */
 
 const https = require('https');
-const { envValue, assertHeaderSafe } = require('./env.js');
+const { envValue, assertHeaderSafe, describeBadChars } = require('./env.js');
+
+// The Supabase anon key is publishable by design — it already ships to every visitor
+// inside js/app.js, and row-level security is what actually guards the data. Keeping a
+// copy here means a mistyped or mangled environment variable cannot stop sign-ins being
+// verified. If the project's key is ever rotated, change it in BOTH places.
+const PUBLISHABLE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InludW5xd21ya3lwdXZhcmdjZWVuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTAxNjM5MTYsImV4cCI6MjEwNTczOTkxNn0.5L8iXBgMPGWGO9AAjqu6fDYfNdohgaEwqg5N9oAiYM8';
 
 const SUPABASE_URL = envValue('SUPABASE_URL', 'https://ynunqwmrkypuvargceen.supabase.co');
-const SUPABASE_ANON_KEY = envValue('SUPABASE_ANON_KEY');
+// A value that survived cleaning but still cannot be sent is worse than no value at all,
+// so fall back to the built-in key and say so in the log rather than failing every upload.
+const SUPABASE_ANON_KEY = (() => {
+  const fromEnv = envValue('SUPABASE_ANON_KEY');
+  if (!fromEnv) return PUBLISHABLE_ANON_KEY;
+  try {
+    return assertHeaderSafe('SUPABASE_ANON_KEY', fromEnv);
+  } catch {
+    console.error('SUPABASE_ANON_KEY contains ' + describeBadChars(fromEnv) +
+      ' and was ignored; using the key built into the code. Re-enter it to silence this.');
+    return PUBLISHABLE_ANON_KEY;
+  }
+})();
 const ALLOWED_DOMAIN = envValue('ALLOWED_EMAIL_DOMAIN', 'email.iimcal.ac.in');
 
 function getJson(url, headers) {

@@ -13,10 +13,10 @@ const https = require('https');
 const { URLSearchParams } = require('url');
 const { envValue, assertHeaderSafe } = require('./env.js');
 
-const CLIENT_ID = assertHeaderSafe('GDRIVE_CLIENT_ID', envValue('GDRIVE_CLIENT_ID'));
-const CLIENT_SECRET = assertHeaderSafe('GDRIVE_CLIENT_SECRET', envValue('GDRIVE_CLIENT_SECRET'));
-const REFRESH_TOKEN = assertHeaderSafe('GDRIVE_REFRESH_TOKEN', envValue('GDRIVE_REFRESH_TOKEN'));
-const ROOT_FOLDER_ID = assertHeaderSafe('GDRIVE_ROOT_FOLDER_ID', envValue('GDRIVE_ROOT_FOLDER_ID'));
+const CLIENT_ID = envValue('GDRIVE_CLIENT_ID');
+const CLIENT_SECRET = envValue('GDRIVE_CLIENT_SECRET');
+const REFRESH_TOKEN = envValue('GDRIVE_REFRESH_TOKEN');
+const ROOT_FOLDER_ID = envValue('GDRIVE_ROOT_FOLDER_ID');
 
 // Only files this app creates — the portal can never read the rest of the Drive
 const SCOPE = 'https://www.googleapis.com/auth/drive.file';
@@ -66,9 +66,9 @@ let _token = null;         // { value, expiresAt }
 async function accessToken() {
   if (_token && _token.expiresAt > Date.now() + 60000) return _token.value;
   const body = new URLSearchParams({
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET,
-    refresh_token: REFRESH_TOKEN,
+    client_id: assertHeaderSafe('GDRIVE_CLIENT_ID', CLIENT_ID),
+    client_secret: assertHeaderSafe('GDRIVE_CLIENT_SECRET', CLIENT_SECRET),
+    refresh_token: assertHeaderSafe('GDRIVE_REFRESH_TOKEN', REFRESH_TOKEN),
     grant_type: 'refresh_token',
   }).toString();
   try {
