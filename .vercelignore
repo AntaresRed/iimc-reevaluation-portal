@@ -1,0 +1,8 @@
+# Only the website itself is deployed. These are for running the portal locally.
+server.js
+drive.js
+connect-drive.js
+start.bat
+data/
+.env
+.env.example

@@ -1,8 +1,8 @@
-// ===== GOOGLE OAUTH — paste your Client ID here =====
-// Get one at: https://console.cloud.google.com/ → APIs & Services → Credentials
-// Add https://iimc-reevaluation-antares.netlify.app AND http://localhost:3000
-// to Authorized JavaScript Origins.
-const GOOGLE_CLIENT_ID = '536511739218-e3p6u17bji326mjktugahdquk9m4i0hr.apps.googleusercontent.com';
+// ===== GOOGLE OAUTH =====
+// Web client from https://console.cloud.google.com/ → APIs & Services → Credentials.
+// Its Authorized JavaScript Origins must list every address the portal is opened from:
+// https://iimc-reevaluation-portal.vercel.app, http://localhost:3001 and http://localhost.
+const GOOGLE_CLIENT_ID = '563924001571-7k30fde9qt6v7g57bsjt4ih27diikd0v.apps.googleusercontent.com';
 
 // ===== PROFESSOR EMAIL DIRECTORY =====
 // Each professor has one canonical @email.iimcal.ac.in email regardless of how many subjects they teach
