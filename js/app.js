@@ -11,8 +11,9 @@ const sb = window.supabase
     })
   : null;
 
-// Dev shortcuts (the [DEV] login panels) only exist when running the portal locally
-const IS_LOCAL_DEV = ['localhost', '127.0.0.1'].includes(location.hostname);
+// The [DEV] login panels stand in for the MBA office and faculty accounts, which don't exist
+// as real Google accounts yet. They only pretend locally: once the data moves to Supabase the
+// database will ignore them, because it trusts verified sign-ins only. Remove before real use.
 
 // ===== PROFESSOR EMAIL DIRECTORY =====
 // Each professor has one canonical @email.iimcal.ac.in email regardless of how many subjects they teach
@@ -1159,7 +1160,14 @@ function showToast(msg, type = 'info') {
 
 // ===== SESSION RESTORE =====
 window.addEventListener('DOMContentLoaded', async () => {
-  // Load data from server (or localStorage fallback) before rendering anything
+  // The [DEV] login panels are hidden in the page markup so they can't flash before the
+  // sign-in check finishes; they're revealed here once the page is ready.
+  document.querySelectorAll('.creds-panel').forEach(p => { p.style.display = ''; });
+  populateCreds();
+  populateAdminCreds();
+
+  // Load data from server (or localStorage fallback) before rendering anything.
+  // Meanwhile the "Signing you in…" screen is showing, so nothing flashes.
   await loadInitialData();
   await loadFaculty();
   await loadWindows();
@@ -1179,8 +1187,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     localStorage.removeItem('reval_session');           // drop any stale dev login
     if (location.search.includes('code=')) history.replaceState(null, '', location.pathname);
     openDashboardForRole();
-  } else if (IS_LOCAL_DEV && localStorage.getItem('reval_session')) {
-    // Dev logins are only honoured on localhost
+  } else if (localStorage.getItem('reval_session')) {
+    // A [DEV] login from this browser
     try {
       currentUser = JSON.parse(localStorage.getItem('reval_session'));
       openDashboardForRole();
@@ -1200,12 +1208,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     });
   }
 
-  // The [DEV] login panels exist only when running locally
-  document.querySelectorAll('.creds-panel').forEach(p => { p.style.display = IS_LOCAL_DEV ? '' : 'none'; });
-  if (IS_LOCAL_DEV) {
-    populateCreds();
-    populateAdminCreds();
-  }
 });
 
 // ===== RE-EVALUATION WINDOWS =====

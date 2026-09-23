@@ -5,9 +5,9 @@
 -- ============================================================================
 
 -- The MBA office. Add or remove rows here to change who can open windows and
--- deactivate students.
+-- deactivate students. Anyone listed here sees the admin dashboard instead of
+-- the student one, so don't list a student's own account.
 insert into public.app_admins (email, note) values
-  ('anuja2027@email.iimcal.ac.in', 'Portal owner'),
   ('mbaoffice@email.iimcal.ac.in', 'MBA Office'),
   ('examcell@email.iimcal.ac.in', 'Exam Cell')
 on conflict (email) do nothing;

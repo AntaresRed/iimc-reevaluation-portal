@@ -1678,3 +1678,25 @@ body.theme-sage .file-upload-area.has-file {
 #google-signin-btn { width: 100%; max-width: 320px; border-radius: 999px; }
 #google-signin-btn svg { background: #fff; border-radius: 50%; padding: 2px; width: 22px; height: 22px; }
 #google-signin-btn:disabled { opacity: 0.6; cursor: wait; transform: none; box-shadow: none; }
+
+/* Shown while the sign-in is being checked */
+.loading-screen {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--iim-cream);
+  color: var(--text-secondary);
+  font-size: 15px;
+}
+.loading-spinner {
+  width: 38px;
+  height: 38px;
+  border: 3px solid var(--border-gold);
+  border-top-color: var(--iim-brown);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
