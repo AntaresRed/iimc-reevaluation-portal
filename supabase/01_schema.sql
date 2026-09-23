@@ -31,12 +31,13 @@ create table if not exists public.faculty (
   added_at    timestamptz not null default now()
 );
 
--- Which professor marks which section of which subject
+-- Which professor marks which section of which subject.
+-- A co-taught section simply has more than one row (e.g. Morphologies of the Social).
 create table if not exists public.course_sections (
   subject         text not null,
   section         text not null check (section in ('A','B','C','D','E','F')),
   professor_name  text not null references public.faculty(name) on update cascade,
-  primary key (subject, section)
+  primary key (subject, section, professor_name)
 );
 
 -- --------------------------------------------------------------- the helpers
@@ -141,7 +142,8 @@ create table if not exists public.requests (
   student_name      text not null,
   reg_no            text not null,
   section           text default '',
-  professor_name    text not null,
+  -- every professor who may see and decide this request (two for a co-taught section)
+  professor_names   text[] not null check (array_length(professor_names, 1) is not null),
   -- copied from the window when the request is created, so later edits can't rewrite history
   subject           text not null,
   course_code       text default '',
@@ -192,7 +194,7 @@ create table if not exists public.request_history (
 create or replace function public.can_see_request(r public.requests)
 returns boolean language sql stable security definer set search_path = public as $$
   select r.student_id = auth.uid()
-      or r.professor_name = public.my_prof_name()
+      or public.my_prof_name() = any (r.professor_names)
       or public.is_admin();
 $$;
 
@@ -205,7 +207,7 @@ returns trigger language plpgsql security definer set search_path = public as $$
 declare
   w public.windows;
   state text;
-  prof text;
+  profs text[];
 begin
   select * into w from public.windows where id = new.window_id;
   if not found then
@@ -230,18 +232,19 @@ begin
     if new.section is null or not (new.section = any (w.sections)) then
       raise exception 'Section % is not part of this re-evaluation window.', coalesce(new.section, '—');
     end if;
-    select cs.professor_name into prof
+    -- Everyone who teaches this section — one professor, or both for a co-taught course
+    select array_agg(cs.professor_name order by cs.professor_name) into profs
       from public.course_sections cs
      where cs.subject = w.subject and cs.section = new.section;
-    if prof is null then
+    if profs is null then
       raise exception 'No professor is assigned to % for section %.', w.subject, new.section;
     end if;
   else
     new.section := '';
-    prof := w.professor;
+    profs := array[w.professor];
   end if;
 
-  new.professor_name := prof;
+  new.professor_names := profs;
   new.subject     := w.subject;
   new.course_code := w.course_code;
   new.exam_type   := w.exam_type;
@@ -264,18 +267,18 @@ begin
 end;
 $$;
 
--- Only the professor of the request (or an admin) may record a decision, and only
+-- Any professor of the request (or an admin) may record a decision, and only
 -- the decision fields may change.
 create or replace function public.requests_before_update()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  if not (old.professor_name = public.my_prof_name() or public.is_admin()) then
-    raise exception 'Only the professor for this request can record a decision.';
+  if not (public.my_prof_name() = any (old.professor_names) or public.is_admin()) then
+    raise exception 'Only a professor for this request can record a decision.';
   end if;
   if new.window_id <> old.window_id or new.student_id <> old.student_id
      or new.subject <> old.subject or new.exam_type <> old.exam_type
      or new.term <> old.term or new.section is distinct from old.section
-     or new.professor_name <> old.professor_name or new.reg_no <> old.reg_no then
+     or new.professor_names <> old.professor_names or new.reg_no <> old.reg_no then
     raise exception 'Only the marks, remarks and status of a request can change.';
   end if;
   if coalesce(new.professor_remarks, '') = '' then
@@ -386,7 +389,7 @@ create policy windows_update on public.windows for update to authenticated
 -- requests: your own, your students', or everything for admins
 drop policy if exists requests_select on public.requests;
 create policy requests_select on public.requests for select to authenticated
-  using (student_id = auth.uid() or professor_name = public.my_prof_name() or public.is_admin());
+  using (student_id = auth.uid() or public.my_prof_name() = any (professor_names) or public.is_admin());
 
 drop policy if exists requests_insert on public.requests;
 create policy requests_insert on public.requests for insert to authenticated
@@ -394,8 +397,8 @@ create policy requests_insert on public.requests for insert to authenticated
 
 drop policy if exists requests_update on public.requests;
 create policy requests_update on public.requests for update to authenticated
-  using (professor_name = public.my_prof_name() or public.is_admin())
-  with check (professor_name = public.my_prof_name() or public.is_admin());
+  using (public.my_prof_name() = any (professor_names) or public.is_admin())
+  with check (public.my_prof_name() = any (professor_names) or public.is_admin());
 
 -- questions and photos follow whatever the parent request allows
 drop policy if exists question_items_select on public.question_items;

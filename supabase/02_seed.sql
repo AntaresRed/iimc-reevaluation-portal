@@ -82,4 +82,4 @@ insert into public.course_sections (subject, section, professor_name) values
   ('Management Game', 'D', 'Prof. Madhuparna Karmokar'),
   ('Management Game', 'E', 'Prof. Saptarshi Purkayastha'),
   ('Management Game', 'F', 'Prof. Sudarshan Kumar')
-on conflict (subject, section) do update set professor_name = excluded.professor_name;
+on conflict (subject, section, professor_name) do nothing;
