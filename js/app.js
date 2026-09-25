@@ -11,9 +11,8 @@ const sb = window.supabase
     })
   : null;
 
-// The [DEV] login panels stand in for the MBA office and faculty accounts, which don't exist
-// as real Google accounts yet. They only pretend locally: once the data moves to Supabase the
-// database will ignore them, because it trusts verified sign-ins only. Remove before real use.
+// The [DEV] login panels sign in the dummy MBA office and faculty accounts, which have no real
+// Google account, with a password (see "[DEV] TEST ACCOUNTS" near the end). Remove before real use.
 
 // ===== PROFESSOR EMAIL DIRECTORY =====
 // Each professor has one canonical @email.iimcal.ac.in email regardless of how many subjects they teach
@@ -103,115 +102,135 @@ let currentProfRequestId = null;
 let currentStudentTab = 'pending';
 let currentProfTab = 'pending';
 
-// ===== STORAGE — server-sync with localStorage fallback =====
-// All reads use the in-memory cache so nothing else needs to be async.
-const SERVER_API = '/api/requests';
-let _cache = [];          // in-memory request cache
-let _serverMode = false;  // true when server is reachable
+// ===== DATA — everything lives in Supabase =====
+// The page reads and writes the database directly with the signed-in person's session.
+// What each person may see or change is decided there (row level security and triggers),
+// so these functions only move data; the rules live in supabase/01_schema.sql.
+// Reads fill in-memory caches, so rendering never has to wait.
+let _cache = [];              // requests the signed-in person may see
 let _uploadProgress = null;   // set while a submission is uploading its photos
 
-// Sync getter — always use the cache
 function getRequests() { return _cache; }
 
-// Browsers cap local storage (~5 MB), which photos can fill on their own
-function cacheRequestsLocally(requests) {
-  try {
-    localStorage.setItem('reval_requests', JSON.stringify(requests));
-  } catch {
-    showToast('This browser could not store the request locally — it is too large. Use the portal with the server running.', 'error');
-  }
+// Database timestamps as the milliseconds the rest of the page works with
+function ms(ts) {
+  return ts ? Date.parse(ts) : null;
 }
 
-// Save: update cache + localStorage + (background) POST to server
-function saveRequests(requests) {
-  _cache = requests;
-  cacheRequestsLocally(requests);
-  if (_serverMode) {
-    fetch(SERVER_API, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ requests }),
-    }).then(res => { if (!res.ok) throw new Error(); })
-      .catch(() => showToast('Could not save to the server. Check that it is running.', 'error'));
-  }
+// The database explains a refusal in its own words; show those, not the plumbing around them
+function dbMessage(error) {
+  const text = (error && error.message) || 'Something went wrong.';
+  if (/JWT|not authenticated|permission denied/i.test(text)) return 'Your session has expired. Please sign in again.';
+  return text;
 }
 
-// Read JSON from localStorage without crashing on a damaged or missing value
-function readLocalJson(key, fallback) {
-  try {
-    const value = JSON.parse(localStorage.getItem(key) || 'null');
-    return value == null ? fallback : value;
-  } catch { return fallback; }
+const REQUEST_SELECT = '*, ' +
+  'question_items(id, position, question, reason, photo_count, question_photos(id, position, file_name, drive_id)), ' +
+  'request_history(at, event, by_email, from_status, to_status, note)';
+
+function requestFromRow(row) {
+  const byPosition = (a, b) => a.position - b.position;
+  const items = (row.question_items || []).slice().sort(byPosition).map(q => ({
+    id: q.id,
+    question: q.question,
+    reason: q.reason,
+    photos: (q.question_photos || []).slice().sort(byPosition).map(p => ({ name: p.file_name, driveId: p.drive_id })),
+    photoCount: q.photo_count || 0,
+  }));
+  const names = row.professor_names || [];
+  const resolved = String(row.status).startsWith('Resolved');
+  return {
+    id: row.id,
+    windowId: row.window_id,
+    studentEmail: row.student_email,
+    studentName: row.student_name,
+    regNo: row.reg_no,
+    section: row.section || '',
+    professorNames: names,
+    professorName: names.join(' & '),
+    subject: row.subject,
+    courseCode: row.course_code || '',
+    examType: row.exam_type,
+    term: row.term,
+    questions: items.map(q => q.question).join(', '),
+    questionItems: items,
+    status: row.status,
+    questionMarks: row.question_marks || null,
+    originalMarks: row.original_marks,
+    updatedMarks: row.updated_marks,
+    professorRemarks: row.professor_remarks,
+    createdAt: ms(row.created_at),
+    reviewedAt: ms(row.reviewed_at),
+    resolvedAt: resolved ? ms(row.reviewed_at) : null,
+    photosDeletedAt: ms(row.photos_deleted_at),
+    photoCountBeforeDeletion: row.photo_count_before_deletion || 0,
+    history: (row.request_history || []).slice().sort((a, b) => ms(a.at) - ms(b.at)).map(h => ({
+      at: ms(h.at), event: h.event, by: h.by_email, from: h.from_status, to: h.to_status, note: h.note,
+    })),
+  };
 }
 
-// Background refresh: updates the cache only when the server answers (never switches to offline mode)
+// Is this professor one of the people deciding the request? (Co-taught sections have two.)
+function isRequestFor(r, profName) {
+  return Boolean(profName) && (r.professorNames || []).includes(profName);
+}
+
 async function refreshRequests() {
-  if (!_serverMode) return false;
-  try {
-    const res = await fetch(SERVER_API, { signal: AbortSignal.timeout(3000) });
-    if (!res.ok) return false;
-    _cache = (await res.json()).requests || [];
-    cacheRequestsLocally(_cache);
-    return true;
-  } catch { return false; }
+  if (!sb || !currentUser) return false;
+  const { data, error } = await sb.from('requests').select(REQUEST_SELECT).order('created_at', { ascending: false });
+  if (error) { console.error('[Data] Requests:', error.message); return false; }
+  _cache = data.map(requestFromRow);
+  return true;
 }
 
-// Create a new request. The server checks the window is open, the section belongs to it,
-// and the student hasn't already applied; offline, it's just stored locally.
-async function submitNewRequest(request) {
-  if (_serverMode) {
-    const res = await fetch('/api/requests/submit', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ request }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'Submission failed');
-    _cache.push(data.request);
-    cacheRequestsLocally(_cache);
-    return data.request;
-  }
-  // No portal server. Get the photos into Drive first so they outlive this browser,
-  // then keep the (now much smaller) request locally until requests move to Supabase.
-  let stored = 0;
-  try {
-    stored = await uploadPhotosToDrive(request, _uploadProgress);
-  } catch (e) {
-    showToast('Photos could not be stored: ' + e.message + ' They are kept on this device only.', 'error');
-  }
-  const requests = getRequests();
-  requests.push(request);
-  saveRequests(requests);
-  if (stored) {
-    showToast(`${stored} photo${stored === 1 ? '' : 's'} saved to the portal's Drive. The request itself is still only on this device.`, 'info');
-  } else {
-    showToast('Saved on this device only — the portal server was not reachable, so nothing was sent to it.', 'error');
-  }
-  return request;
+// Re-read one request after changing it, so the page shows exactly what was stored
+async function reloadRequest(id) {
+  const { data, error } = await sb.from('requests').select(REQUEST_SELECT).eq('id', id).single();
+  if (error) throw new Error(dbMessage(error));
+  const fresh = requestFromRow(data);
+  const idx = _cache.findIndex(x => x.id === id);
+  if (idx === -1) _cache.unshift(fresh); else _cache[idx] = fresh;
+  return fresh;
 }
 
-// Called once on page load — try server first, fall back to localStorage
-async function loadInitialData() {
-  try {
-    const res = await fetch(SERVER_API, { signal: AbortSignal.timeout(1500) });
-    if (!res.ok) throw new Error('bad status');
-    const data = await res.json();
-    _cache = data.requests || [];
-    _serverMode = true;
-    // Keep localStorage in sync
-    cacheRequestsLocally(_cache);
-    console.log(`[Storage] Server mode — ${_cache.length} requests loaded from data/requests.json`);
-  } catch {
-    // Server not running — use localStorage
-    _cache = readLocalJson('reval_requests', []);
-    _serverMode = false;
-    console.log(`[Storage] Offline mode — ${_cache.length} requests loaded from localStorage`);
+// A new request. The database checks the window is open, the section belongs to it, the
+// student hasn't applied already and isn't deactivated, and copies the exam details and
+// professors from the window. Photos then go to Drive, one at a time, and are recorded.
+// Returns { request, photoProblem }: the request stands even if a photo could not be stored.
+async function submitNewRequest(form) {
+  const { data: id, error } = await sb.rpc('submit_request', {
+    p_window_id: form.windowId,
+    p_student_name: form.studentName,
+    p_reg_no: form.regNo,
+    p_section: form.section,
+    p_items: form.items.map(q => ({ question: q.question, reason: q.reason })),
+  });
+  if (error) throw new Error(dbMessage(error));
+
+  let request = await reloadRequest(id);
+  let photoProblem = '';
+  if (form.items.some(q => q.photos.length)) {
+    try {
+      await uploadRequestPhotos(request, form.items, _uploadProgress);
+    } catch (e) {
+      photoProblem = e.message;
+    }
+    request = await reloadRequest(id);
   }
+  return { request, photoProblem };
 }
 
-function generateId() {
-  return 'IIMC-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).substr(2, 4).toUpperCase();
+// The professor's decision. The database works out the status from the marks.
+async function saveReview(id, questionMarks) {
+  const { data, error } = await sb.from('requests')
+    .update({ question_marks: questionMarks, status: 'Resolved - No Change' })
+    .eq('id', id)
+    .select('id');
+  if (error) throw new Error(dbMessage(error));
+  if (!data || !data.length) throw new Error('You can only decide requests for your own sections.');
+  return reloadRequest(id);
 }
+
 function formatDate(ts) {
   return new Date(ts).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
 }
@@ -384,16 +403,11 @@ function collectQuestionItems() {
   return { items };
 }
 
-// ----- Reading questions back on the request screens -----
-// A stored photo is a plain file name, or { name, driveId } once it lives in Google Drive.
-// Either way the browser asks the portal for it — Drive ids never reach the page.
-// ===== HOSTED PHOTO UPLOAD =====
-// With no portal server behind it, the hosted site would keep every photo as a base64 string
-// in this browser: invisible to the professor and gone the moment site data is cleared.
-// Each photo is sent to /api/photo-upload instead, which stores it in the portal's Google
-// Drive and hands back a file id. Only the id is kept in the request.
+// ===== PHOTO UPLOAD =====
+// Each photo is sent to /api/photo-upload, which stores it in the portal's Google Drive and
+// hands back a file id. Only the id is kept in the database, as { name, driveId }.
 
-// Upload endpoints need the Supabase session token; the dummy dev logins have none.
+// The photo functions need the Supabase session token to know who is asking
 async function supabaseAccessToken() {
   if (!sb) return null;
   try {
@@ -402,52 +416,40 @@ async function supabaseAccessToken() {
   } catch { return null; }
 }
 
-async function uploadOnePhoto(token, request, name, dataUrl) {
+async function uploadOnePhoto(token, requestId, name, dataUrl) {
   const res = await fetch('/api/photo-upload', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      requestId: request.id,
-      regNo: request.regNo,
-      studentName: request.studentName,
-      subject: request.subject,
-      examType: request.examType,
-      term: request.term,
-      name,
-      dataUrl,
-    }),
+    body: JSON.stringify({ requestId, name, dataUrl }),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || `Upload failed (${res.status})`);
   return data;
 }
 
-// Replaces every data: URL in the request with { name, driveId }. Returns how many moved.
-// Throws if the photos could not be stored, so the caller can decide what to tell the student.
-async function uploadPhotosToDrive(request, onProgress) {
-  const items = request.questionItems || [];
-  const pending = [];
-  items.forEach((q, qi) => (q.photos || []).forEach((photo, pi) => {
-    if (typeof photo === 'string' && photo.startsWith('data:image/')) pending.push({ qi, pi, dataUrl: photo });
-  }));
-  if (!pending.length) return 0;
-
+// Each photo goes to Drive through /api/photo-upload, which checks the request is this
+// student's own and still pending, and is then recorded against its question.
+async function uploadRequestPhotos(request, items, onProgress) {
   const token = await supabaseAccessToken();
-  if (!token) throw new Error('Photos can only be uploaded when signed in with Google.');
+  if (!token) throw new Error('please sign in again.');
+  const pending = [];
+  items.forEach((q, qi) => q.photos.forEach((dataUrl, pi) => pending.push({ qi, pi, dataUrl })));
 
   let done = 0;
   for (const p of pending) {
-    const label = photoLabel(items[p.qi].question, p.qi);
-    const saved = await uploadOnePhoto(token, request, `${label} - ${p.pi + 1}`, p.dataUrl);
-    items[p.qi].photos[p.pi] = { name: saved.name, driveId: saved.driveId };
-    if (saved.folderId) request.driveFolderId = saved.folderId;
+    const item = request.questionItems[p.qi];
+    const saved = await uploadOnePhoto(token, request.id, `${photoLabel(item.question, p.qi)} - ${p.pi + 1}`, p.dataUrl);
+    const { error } = await sb.from('question_photos').insert({
+      question_item_id: item.id, position: p.pi + 1, file_name: saved.name, drive_id: saved.driveId,
+    });
+    if (error) throw new Error(dbMessage(error));
     done++;
     if (onProgress) onProgress(done, pending.length);
   }
   return done;
 }
 
-// Same naming the local server uses, so a photo is called the same thing either way
+// "Q2(b) - 1": the name a photo gets in Drive
 function photoLabel(question, index) {
   const safe = String(question).replace(/[^A-Za-z0-9()._-]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 40);
   return safe || `Question ${index + 1}`;
@@ -491,16 +493,36 @@ function photoViewerKeys(e) {
   if (e.key === 'Escape') closePhotoViewer();
 }
 
-function photoUrl(requestId, photo) {
+// Photos are private: /api/photo-get hands one over only to a signed-in person who may see its
+// request. An <img> can't send the sign-in token, so the page fetches each photo itself and
+// shows it from memory, once per visit. Called whenever a modal opens.
+const _photoCache = new Map();   // Drive id → Promise of an object URL ('' if unavailable)
+
+function photoImgHtml(photo, alt) {
   const name = photoName(photo);
-  // A photo that never made it off this device is shown straight from the browser
-  if (name.startsWith('data:image/')) return name;
-  // Hosted: the local server is not there to look the photo up, so fetch it from Drive by id
-  if (!_serverMode && photo && photo.driveId) {
-    const ext = (name.split('.').pop() || 'jpg').toLowerCase();
-    return `/api/photo-get?id=${encodeURIComponent(photo.driveId)}&ext=${encodeURIComponent(ext)}`;
+  if (name.startsWith('data:image/')) return `<img src="${name}" alt="${alt}" />`;
+  const ext = (name.split('.').pop() || 'jpg').toLowerCase();
+  return `<img data-photo-id="${escapeHtml((photo && photo.driveId) || '')}" data-photo-ext="${escapeHtml(ext)}" alt="${alt}" />`;
+}
+
+async function loadProtectedPhotos(root) {
+  const imgs = [...root.querySelectorAll('img[data-photo-id]:not([src])')].filter(img => img.dataset.photoId);
+  if (!imgs.length) return;
+  const token = await supabaseAccessToken();
+  for (const img of imgs) {
+    const id = img.dataset.photoId;
+    if (!_photoCache.has(id)) {
+      _photoCache.set(id, fetch(`/api/photo-get?id=${encodeURIComponent(id)}&ext=${encodeURIComponent(img.dataset.photoExt)}`,
+        { headers: { Authorization: `Bearer ${token}` } })
+        .then(res => res.ok ? res.blob() : Promise.reject(new Error(String(res.status))))
+        .then(blob => URL.createObjectURL(blob))
+        .catch(() => { _photoCache.delete(id); return ''; }));
+    }
+    _photoCache.get(id).then(url => {
+      if (url) img.src = url;
+      else img.alt = 'Photo unavailable';
+    });
   }
-  return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(name)}`;
 }
 
 // `after(i)` adds content under question i: the marks fields, or the marks once decided
@@ -524,7 +546,7 @@ function questionListHtml(r, { photos = true, after = () => '' } = {}) {
       ${(photos && q.photos && q.photos.length) ? `<div class="q-view-photos">${q.photos.map(photo => `
         <button type="button" class="q-photo" title="Open full size"
           onclick="openPhotoViewer(this.querySelector('img').src, this.querySelector('img').alt)">
-          <img src="${photoUrl(r.id, photo)}" alt="Photo of ${escapeHtml(q.question)}" loading="lazy" />
+          ${photoImgHtml(photo, 'Photo of ' + escapeHtml(q.question))}
         </button>`).join('')}</div>` : ''}
       ${(photos && !(q.photos || []).length && q.photoCount) ? `<div class="q-view-gone">🗑️ ${q.photoCount} photo${q.photoCount === 1 ? '' : 's'} were deleted ${PHOTO_RETENTION_DAYS} days after this request was closed.</div>` : ''}
       ${after(i)}
@@ -534,25 +556,6 @@ function questionListHtml(r, { photos = true, after = () => '' } = {}) {
 // ===== SHARED HELPERS =====
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-// Replace one request in the cache with the server's copy
-function replaceCachedRequest(updated) {
-  const idx = _cache.findIndex(x => x.id === updated.id);
-  if (idx !== -1) _cache[idx] = updated; else _cache.push(updated);
-  cacheRequestsLocally(_cache);
-}
-
-async function postRequestAction(id, action, body) {
-  const res = await fetch(`/api/requests/${encodeURIComponent(id)}/${action}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || 'Request failed');
-  replaceCachedRequest(data.request);
-  return data.request;
 }
 
 // ===== HISTORY TIMELINE RENDERER =====
@@ -570,8 +573,8 @@ function renderHistoryTimeline(r) {
     }
   }
 
-  const icons = { 'Submitted': '📨', 'Status changed': '🔄', 'Remarks updated': '✏️' };
-  const dots = { 'Submitted': 'dot-submit', 'Status changed': 'dot-change', 'Remarks updated': 'dot-remark' };
+  const icons = { 'Submitted': '📨', 'Status changed': '🔄', 'Remarks updated': '✏️', 'Photos deleted': '🗑️' };
+  const dots = { 'Submitted': 'dot-submit', 'Status changed': 'dot-change', 'Remarks updated': 'dot-remark', 'Photos deleted': 'dot-remark' };
 
   const rows = entries.map((e, i) => {
     const isLast = i === entries.length - 1;
@@ -612,9 +615,9 @@ function renderHistoryTimeline(r) {
 // and the professor follows from the subject + section mapping.
 let _formWindow = null;
 
+// Everyone who teaches this section: one professor, or both for a co-taught course
 function professorFor(subject, section) {
-  const entry = PROF_MAP.find(e => e.subject === subject && e.sections.includes(section));
-  return entry ? entry.professor : '';
+  return PROF_MAP.filter(e => e.subject === subject && e.sections.includes(section)).map(e => e.professor).join(' & ');
 }
 
 function onSectionChange() {
@@ -714,9 +717,11 @@ async function userFromSession(session) {
   const email = (user.email || '').toLowerCase();
   const { data: role, error } = await sb.rpc('my_role');
   if (error) console.error('[Auth] Could not read role:', error.message);
+  // The dummy test accounts have no Google profile, so name them from the portal's own lists
+  const knownName = (ADMIN_ACCOUNTS.find(a => a.email === email) || {}).name || EMAIL_TO_PROF[email];
   return {
     email,
-    name: meta.full_name || meta.name || email.split('@')[0],
+    name: meta.full_name || meta.name || knownName || email.split('@')[0],
     picture: meta.avatar_url || meta.picture || '',
     role: error ? 'student' : role,          // the least-privileged role if the check fails
     verified: true,
@@ -736,10 +741,13 @@ function getProfMapEntriesForUser() {
 }
 
 async function signOut() {
-  if (sb && currentUser && currentUser.verified) {
+  if (sb) {
     try { await sb.auth.signOut(); } catch (e) { console.error('[Auth] Sign-out:', e); }
   }
   currentUser = null;
+  _cache = [];
+  _windows = [];
+  _blocks = [];
   document.body.classList.remove('theme-sage');
   localStorage.removeItem('reval_session');
   showPage('page-login');
@@ -983,8 +991,8 @@ async function submitRevalForm(e) {
     showToast(`Your registration number is in Section ${regSection}, not Section ${section}.`, 'error');
     return;
   }
-  const professorName = sectioned ? professorFor(w.subject, section) : w.professor;
-  if (!professorName) {
+  const professorNames = sectioned ? professorFor(w.subject, section) : w.professor;
+  if (!professorNames) {
     showToast(sectioned ? `No professor is mapped to ${w.subject} for Section ${section}.` : 'This window has no reviewing professor.', 'error');
     return;
   }
@@ -1000,31 +1008,15 @@ async function submitRevalForm(e) {
   // Photos go up one at a time, so say which one
   _uploadProgress = (done, total) => { submitBtn.textContent = `Uploading photo ${done} of ${total}...`; };
 
-  const now = Date.now();
-  const request = {
-    id: generateId(),
-    windowId: w.id,
-    studentEmail: currentUser.email,
-    studentName: document.getElementById('f-name').value.trim(),
-    regNo: document.getElementById('f-regno').value.trim(),
-    professorName,
-    subject: w.subject,
-    courseCode: w.courseCode || '',
-    section,
-    examType: w.examType,
-    term: w.term,
-    questions: collected.items.map(q => q.question).join(', '),
-    questionItems: collected.items,
-    status: 'Pending',
-    createdAt: now,
-    originalMarks: null,
-    updatedMarks: null,
-    professorRemarks: null,
-    history: [{ at: now, event: 'Submitted', by: currentUser.email, note: '' }],
-  };
-
+  let photoProblem = '';
   try {
-    await submitNewRequest(request);
+    ({ photoProblem } = await submitNewRequest({
+      windowId: w.id,
+      studentName: document.getElementById('f-name').value.trim(),
+      regNo: document.getElementById('f-regno').value.trim(),
+      section,
+      items: collected.items,
+    }));
   } catch (err) {
     showToast('Could not submit: ' + err.message, 'error');
     return;
@@ -1039,7 +1031,8 @@ async function submitRevalForm(e) {
   renderStudentStats();
   renderStudentOpenWindows();
   switchStudentTab('pending', document.querySelector('#page-student .tab'));
-  jokaToast('submit', section);
+  if (photoProblem) showToast('Your request was submitted, but some photos could not be stored: ' + photoProblem, 'error');
+  else jokaToast('submit', section);
 }
 
 // ===== PROFESSOR DASHBOARD =====
@@ -1072,7 +1065,7 @@ function initProfDashboard() {
 function getProfRequests() {
   const myName = resolveProfessorName(currentUser.email);
   if (!myName) return [];
-  return getRequests().filter(r => r.professorName === myName);
+  return getRequests().filter(r => isRequestFor(r, myName));
 }
 
 function renderProfStats() {
@@ -1107,7 +1100,6 @@ function renderProfRequests(tab) {
     <div class="empty-state">
       <div class="empty-icon">📭</div>
       <p>No requests in this category.</p>
-      ${_serverMode ? '' : '<button class="btn-primary-sm" onclick="loadDemoData()">Load demo requests</button>'}
     </div>`;
     return;
   }
@@ -1159,19 +1151,6 @@ function resultFromMarks(original, updated) {
   if (original == null || updated == null || !Number.isFinite(original) || !Number.isFinite(updated)) return '';
   const diff = Math.round(updated * 100) - Math.round(original * 100);
   return diff > 0 ? 'increased' : diff < 0 ? 'decreased' : 'unchanged';
-}
-
-// "Q2: 6, Q4: 10" and "Q2: 8 (Increased) — remark" — kept on the request for the CSV and history
-function marksSummary(marks, key) {
-  return marks.map(m => `${m.question}: ${formatMark(m[key])}`).join(', ');
-}
-
-function remarksSummary(marks) {
-  return marks.map(m => `${m.question} (${QUESTION_RESULTS[m.result]}): ${m.remark}`).join('\n');
-}
-
-function statusFromMarks(marks) {
-  return marks.some(m => m.result !== 'unchanged') ? 'Resolved - Marks Changed' : 'Resolved - No Change';
 }
 
 // The professor's fields under one question
@@ -1298,126 +1277,31 @@ async function submitProfReview() {
   const questionMarks = readReviewMarks();
   const problem = checkReviewMarks(questionMarks);
   if (problem) { showToast(problem, 'error'); return; }
-  const status = statusFromMarks(questionMarks);
-  const remarks = remarksSummary(questionMarks);
 
-  // Server mode: the server records the decision
-  if (_serverMode) {
-    const btn = document.querySelector('#prof-review-modal .form-actions .btn-primary');
-    const label = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = 'Saving...';
-    try {
-      const r = await postRequestAction(currentProfRequestId, 'review', {
-        questionMarks, by: currentUser.email,
-      });
-      closeModal('prof-review-modal');
-      renderProfStats();
-      renderProfRequests(currentProfTab);
-      showToast('Decision saved and student notified.', 'success');
-    } catch (err) {
-      showToast('Could not save decision: ' + err.message, 'error');
-    } finally {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
-    return;
+  const btn = document.querySelector('#prof-review-modal .form-actions .btn-primary');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+  try {
+    await saveReview(currentProfRequestId, questionMarks);
+    closeModal('prof-review-modal');
+    renderProfStats();
+    renderProfRequests(currentProfTab);
+    showToast('Decision saved.', 'success');
+  } catch (err) {
+    showToast('Could not save decision: ' + err.message, 'error');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
   }
-
-  const requests = getRequests();
-  const idx = requests.findIndex(r => r.id === currentProfRequestId);
-  if (idx === -1) return;
-
-  const oldStatus = requests[idx].status;
-  requests[idx].questionMarks = questionMarks;
-  requests[idx].originalMarks = marksSummary(questionMarks, 'original');
-  requests[idx].updatedMarks = marksSummary(questionMarks, 'updated');
-  requests[idx].professorRemarks = remarks;
-  requests[idx].status = status;
-  requests[idx].reviewedAt = Date.now();
-  if (!Array.isArray(requests[idx].history)) requests[idx].history = [];
-  requests[idx].history.push({
-    at: Date.now(),
-    event: oldStatus === status ? 'Remarks updated' : 'Status changed',
-    by: currentUser.email,
-    from: oldStatus,
-    to: status,
-    note: remarks,
-  });
-  saveRequests(requests);
-
-  closeModal('prof-review-modal');
-  renderProfStats();
-  renderProfRequests(currentProfTab);
-  showToast('Decision saved and student notified.', 'success');
-}
-
-// ===== DEMO DATA =====
-function loadDemoData() {
-  // Use actual mapping entries for demo
-  const demos = [
-    {
-      id: generateId(),
-      studentEmail: 'student1@email.iimcal.ac.in',
-      studentName: 'Ananya Bose',
-      regNo: 'MBA24-0042',
-      professorName: getProfRequests().length ? getProfRequests()[0]?.professorName : PROF_MAP[0].professor,
-      subject: PROF_MAP[0].subject,
-      section: PROF_MAP[0].sections[0],
-      examType: 'End Term',
-      term: 'Term 3, 2024-25',
-      questions: 'Q2(b), Q4',
-      reason: 'I believe Q2(b) was marked incorrectly — the formula I used yields the right answer by an alternate approach. For Q4, partial credit was not awarded for the correct methodology.',
-      status: 'Pending',
-      createdAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
-      originalMarks: null, updatedMarks: null, professorRemarks: null,
-    },
-    {
-      id: generateId(),
-      studentEmail: 'student2@email.iimcal.ac.in',
-      studentName: 'Rohan Mehta',
-      regNo: 'MBA24-0089',
-      professorName: PROF_MAP[8].professor,
-      subject: PROF_MAP[8].subject,
-      section: PROF_MAP[8].sections[0],
-      examType: 'Mid Term',
-      term: 'Term 2, 2024-25',
-      questions: 'Q7(a), Q7(c), Q9',
-      reason: 'The demand-supply analysis in Q7 was based on the correct model discussed in class. Q9 graphical answer was accurate.',
-      status: 'Pending',
-      createdAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
-      originalMarks: null, updatedMarks: null, professorRemarks: null,
-    },
-    {
-      id: generateId(),
-      studentEmail: 'student3@email.iimcal.ac.in',
-      studentName: 'Priya Sharma',
-      regNo: 'MBA24-0011',
-      professorName: PROF_MAP[11].professor,
-      subject: PROF_MAP[11].subject,
-      section: PROF_MAP[11].sections[0],
-      examType: 'End Term',
-      term: 'Term 3, 2024-25',
-      questions: 'Q1, Q3',
-      reason: 'My interpretation of Q1 aligns with the framework covered in Week 6 slides. I am requesting a re-check of Q3 as well.',
-      status: 'Under Review',
-      createdAt: Date.now() - 7 * 24 * 60 * 60 * 1000,
-      originalMarks: null, updatedMarks: null, professorRemarks: null,
-    }
-  ];
-
-  const requests = getRequests();
-  demos.forEach(d => requests.push(d));
-  saveRequests(requests);
-  renderProfStats();
-  renderProfRequests(currentProfTab);
-  showToast('Demo requests loaded!', 'success');
 }
 
 // ===== MODAL HELPERS =====
 function openModal(id) {
-  document.getElementById(id).classList.add('open');
+  const modal = document.getElementById(id);
+  modal.classList.add('open');
   document.body.style.overflow = 'hidden';
+  loadProtectedPhotos(modal);
 }
 function closeModal(id) {
   document.getElementById(id).classList.remove('open');
@@ -1440,57 +1324,52 @@ function showToast(msg, type = 'info') {
   _toastTimer = setTimeout(() => t.classList.remove('show'), 3500);
 }
 
-// ===== SESSION RESTORE =====
+// ===== START-UP =====
+// A signed-in session is restored (or finished, when coming back from Google), the data this
+// person may see is loaded, and their dashboard opens. Without a session: the sign-in page.
 window.addEventListener('DOMContentLoaded', async () => {
   // The [DEV] login panels are hidden in the page markup so they can't flash before the
   // sign-in check finishes; they're revealed here once the page is ready.
   document.querySelectorAll('.creds-panel').forEach(p => { p.style.display = ''; });
   populateCreds();
   populateAdminCreds();
-
-  // Load data from server (or localStorage fallback) before rendering anything.
-  // Meanwhile the "Signing you in…" screen is showing, so nothing flashes.
-  await loadInitialData();
-  await loadFaculty();
-  await loadWindows();
+  localStorage.removeItem('reval_session');   // left over from the old pretend [DEV] logins
 
   const authError = takeAuthErrorFromUrl();
   if (authError) setAuthError(authError);
 
-  // A real Google session wins. Supabase finishes the sign-in here when returning from Google.
   let session = null;
   if (sb) {
     try { ({ data: { session } } = await sb.auth.getSession()); }
     catch (e) { console.error('[Auth] Session check:', e); }
+  } else {
+    setAuthError('Sign-in could not load. Check your internet connection and refresh.');
   }
 
   if (session) {
-    currentUser = await userFromSession(session);
-    localStorage.removeItem('reval_session');           // drop any stale dev login
     if (location.search.includes('code=')) history.replaceState(null, '', location.pathname);
-    openDashboardForRole();
-  } else if (localStorage.getItem('reval_session')) {
-    // A [DEV] login from this browser
-    try {
-      currentUser = JSON.parse(localStorage.getItem('reval_session'));
-      openDashboardForRole();
-    } catch { showPage('page-login'); }
+    await startSession(session);
   } else {
-    localStorage.removeItem('reval_session');
     showPage('page-login');
   }
 
   // Signed out in another tab, or the session expired
   if (sb) {
     sb.auth.onAuthStateChange((event) => {
-      if (event === 'SIGNED_OUT' && currentUser && currentUser.verified) {
+      if (event === 'SIGNED_OUT' && currentUser) {
         currentUser = null;
         showPage('page-login');
       }
     });
   }
-
 });
+
+// Load everything this person may see, then open their dashboard
+async function startSession(session) {
+  currentUser = await userFromSession(session);
+  await Promise.all([loadFaculty(), loadWindows(), refreshRequests()]);
+  openDashboardForRole();
+}
 
 // ===== RE-EVALUATION WINDOWS =====
 // Admins open a window for a subject + exam + term, optionally limited to sections, with opening and
@@ -1512,23 +1391,30 @@ let _editingWindowId = null;   // set while the window form edits an existing wi
 
 function getWindows() { return _windows; }
 
-// Server first, localStorage when offline (same pattern as requests)
-async function loadWindows() {
-  if (_serverMode) {
-    try {
-      const res = await fetch('/api/windows', { signal: AbortSignal.timeout(1500) });
-      if (res.ok) {
-        _windows = (await res.json()).windows || [];
-        localStorage.setItem('reval_windows', JSON.stringify(_windows));
-        return;
-      }
-    } catch { /* fall through to the local copy */ }
-  }
-  try { _windows = JSON.parse(localStorage.getItem('reval_windows') || '[]'); } catch { _windows = []; }
+function windowFromRow(w) {
+  return {
+    id: w.id,
+    subject: w.subject,
+    courseCode: w.course_code || '',
+    examType: w.exam_type,
+    sections: w.sections || [],
+    professor: w.professor || '',
+    term: w.term,
+    startsAt: ms(w.starts_at),
+    endsAt: ms(w.ends_at),
+    closedAt: ms(w.closed_at),
+    createdBy: w.created_by,
+    createdAt: ms(w.created_at),
+    updatedBy: w.updated_by,
+    updatedAt: ms(w.updated_at),
+  };
 }
 
-function saveWindowsLocally() {
-  localStorage.setItem('reval_windows', JSON.stringify(_windows));
+async function loadWindows() {
+  if (!sb || !currentUser) return;
+  const { data, error } = await sb.from('windows').select('*').order('starts_at', { ascending: false });
+  if (error) { console.error('[Data] Windows:', error.message); return; }
+  _windows = data.map(windowFromRow);
 }
 
 function windowEnd(w) {
@@ -1622,7 +1508,7 @@ function openWindowDetail(id) {
     rows.push(['Requests Received', String(requestsInWindow(w.id).length)]);
     rows.push(['Opened By', escapeHtml(w.createdBy || '—')]);
   } else if (role === 'professor') {
-    const mine = requestsInWindow(w.id).filter(r => r.professorName === resolveProfessorName(currentUser.email)).length;
+    const mine = requestsInWindow(w.id).filter(r => isRequestFor(r, resolveProfessorName(currentUser.email))).length;
     rows.push(['Your Requests', String(mine)]);
   }
 
@@ -1731,7 +1617,7 @@ function renderProfOpenWindows() {
       if (w.professor !== profName) return '';
       who = 'All students';
     }
-    const count = requestsInWindow(w.id).filter(r => r.professorName === profName).length;
+    const count = requestsInWindow(w.id).filter(r => isRequestFor(r, profName)).length;
     return `<div class="prof-win-row" onclick="openWindowDetail('${w.id}')" title="View details">
       <span class="win-badge win-badge-open">● Re-evaluation Open</span>
       <span class="prof-win-title">${windowTitle(w)} · ${escapeHtml(w.examType)} · ${escapeHtml(w.term)}</span>
@@ -2012,31 +1898,42 @@ function updateWindowProfessorField() {
 }
 
 // ----- Faculty directory -----
-// Built-in professors come from PROF_EMAILS; the office can add more, which are stored on the server
-// and merged in here so they can sign in, be suggested, and review requests.
+// The faculty directory and who teaches which section come from the database. PROF_EMAILS and
+// PROF_MAP above only fill the [DEV] login list until someone signs in; then they are replaced.
+// Professors the office added from the window form are marked as added.
 let _addedFaculty = [];
 
 async function loadFaculty() {
-  let list = [];
-  if (_serverMode) {
-    try {
-      const res = await fetch('/api/faculty', { signal: AbortSignal.timeout(1500) });
-      if (res.ok) {
-        list = (await res.json()).faculty || [];
-        localStorage.setItem('reval_faculty', JSON.stringify(list));
-      }
-    } catch { /* fall back to the local copy */ }
+  if (!sb || !currentUser) return;
+  const [fac, secs] = await Promise.all([
+    sb.from('faculty').select('email, name, added_by'),
+    sb.from('course_sections').select('subject, section, professor_name'),
+  ]);
+  const error = fac.error || secs.error;
+  if (error) { console.error('[Data] Faculty:', error.message); return; }
+
+  for (const key of Object.keys(PROF_EMAILS)) delete PROF_EMAILS[key];
+  for (const key of Object.keys(EMAIL_TO_PROF)) delete EMAIL_TO_PROF[key];
+  _addedFaculty = [];
+  fac.data.slice().sort((a, b) => a.name.localeCompare(b.name)).forEach(registerFaculty);
+
+  // One entry per professor per subject, with their sections — the shape the page uses
+  const entries = new Map();
+  for (const row of secs.data) {
+    const key = row.professor_name + '\u0000' + row.subject;
+    if (!entries.has(key)) entries.set(key, { professor: row.professor_name, subject: row.subject, sections: [], termCoverage: 'Both' });
+    entries.get(key).sections.push(row.section);
   }
-  if (!list.length) {
-    try { list = JSON.parse(localStorage.getItem('reval_faculty') || '[]'); } catch { list = []; }
-  }
-  list.forEach(registerFaculty);
+  PROF_MAP.length = 0;
+  [...entries.values()]
+    .sort((a, b) => a.subject.localeCompare(b.subject) || a.professor.localeCompare(b.professor))
+    .forEach(e => { e.sections.sort(); PROF_MAP.push(e); });
 }
 
 function registerFaculty(f) {
   PROF_EMAILS[f.name] = f.email;
   EMAIL_TO_PROF[f.email] = f.name;
-  if (!_addedFaculty.some(x => x.email === f.email)) _addedFaculty.push(f);
+  if (f.added_by && !_addedFaculty.some(x => x.email === f.email)) _addedFaculty.push({ name: f.name, email: f.email });
 }
 
 function facultyList() {
@@ -2162,24 +2059,12 @@ async function addNewProfessor() {
     return;
   }
 
-  let saved = { name, email, addedBy: currentUser.email, addedAt: Date.now() };
-  if (_serverMode) {
-    try {
-      const res = await fetch('/api/faculty', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(saved),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Could not add the professor');
-      saved = data.faculty;
-    } catch (err) {
-      showToast(err.message, 'error');
-      return;
-    }
+  const { data: saved, error } = await sb.from('faculty').insert({ name, email }).select().single();
+  if (error) {
+    showToast(/duplicate key/i.test(error.message) ? 'That professor is already in the faculty list.' : dbMessage(error), 'error');
+    return;
   }
   registerFaculty(saved);
-  localStorage.setItem('reval_faculty', JSON.stringify(_addedFaculty));
   populateCreds();
   pickProfessor(saved.name);
   showToast(`${saved.name} added to the faculty list.`, 'success');
@@ -2242,7 +2127,6 @@ async function submitWindowForm(e) {
     term: document.getElementById('w-term').value.trim(),
     startsAt: fromLocalInput(document.getElementById('w-start').value),
     endsAt: fromLocalInput(document.getElementById('w-end').value),
-    [editing ? 'updatedBy' : 'createdBy']: currentUser.email,
   };
   if (!payload.subject) { showToast('Please choose or enter the subject.', 'error'); return; }
   if (!examType) { showToast('Please choose or enter the type of exam.', 'error'); return; }
@@ -2255,30 +2139,23 @@ async function submitWindowForm(e) {
   if (!(payload.endsAt > payload.startsAt)) { showToast('The window must close after it opens.', 'error'); return; }
   if (payload.endsAt <= Date.now()) { showToast('The closing time is already in the past.', 'error'); return; }
 
-  let saved;
-  if (_serverMode) {
-    try {
-      const res = await fetch(editing ? `/api/windows/${encodeURIComponent(editing)}` : '/api/windows', {
-        method: editing ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Could not save the window');
-      saved = data.window;
-    } catch (err) {
-      showToast(err.message, 'error');
-      return;
-    }
-  } else if (editing) {
-    saved = { ...getWindows().find(x => x.id === editing), ...payload };
-  } else {
-    saved = { id: 'WIN-' + Date.now().toString(36).toUpperCase(), ...payload, closedAt: null, createdAt: Date.now() };
-  }
+  const row = {
+    subject: payload.subject,
+    course_code: payload.courseCode,
+    exam_type: payload.examType,
+    sections: payload.sections,
+    professor: payload.professor,
+    term: payload.term,
+    starts_at: new Date(payload.startsAt).toISOString(),
+    ends_at: new Date(payload.endsAt).toISOString(),
+  };
+  const query = editing ? sb.from('windows').update(row).eq('id', editing) : sb.from('windows').insert(row);
+  const { data, error } = await query.select().single();
+  if (error) { showToast(dbMessage(error), 'error'); return; }
+  const saved = windowFromRow(data);
 
   const idx = _windows.findIndex(x => x.id === saved.id);
   if (idx === -1) _windows.push(saved); else _windows[idx] = saved;
-  saveWindowsLocally();
   _editingWindowId = null;
 
   closeModal('window-form-modal');
@@ -2297,20 +2174,10 @@ async function endWindow(id) {
   const verb = windowStateOf(w) === 'open' ? 'End' : 'Cancel';
   if (!confirm(`${verb} the re-evaluation window for ${w.subject} · ${w.examType} now? Students will no longer be able to apply.`)) return;
 
-  if (_serverMode) {
-    try {
-      const res = await fetch(`/api/windows/${encodeURIComponent(id)}/close`, { method: 'POST' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.error || 'Could not end the window');
-      Object.assign(w, data.window);
-    } catch (err) {
-      showToast(err.message, 'error');
-      return;
-    }
-  } else {
-    w.closedAt = Date.now();
-  }
-  saveWindowsLocally();
+  const { data, error } = await sb.from('windows').update({ closed_at: new Date().toISOString() })
+    .eq('id', id).select().single();
+  if (error) { showToast(dbMessage(error), 'error'); return; }
+  Object.assign(w, windowFromRow(data));
   renderAdminDashboard();
   showToast('Window closed.', 'success');
 }
@@ -2492,25 +2359,34 @@ function isFeePayable(r) {
   return r.status === PAYABLE_STATUS;
 }
 
+function blockFromRow(b) {
+  return {
+    id: b.id,
+    emails: b.emails || [],
+    regNos: b.reg_nos || [],
+    name: b.name || '',
+    reason: b.reason,
+    blockedBy: b.blocked_by,
+    blockedAt: ms(b.blocked_at),
+    liftedAt: ms(b.lifted_at),
+    liftedBy: b.lifted_by,
+    liftNote: b.lift_note,
+  };
+}
+
+// Only the office can read the list and the reasons
 async function loadBlocks() {
-  if (!_serverMode) { _blocks = []; return; }
-  try {
-    const res = await fetch('/api/blocks', { signal: AbortSignal.timeout(3000) });
-    if (res.ok) _blocks = (await res.json()).blocks || [];
-  } catch { /* keep the previous list */ }
+  if (!sb || !currentUser || currentUser.role !== 'admin') { _blocks = []; return; }
+  const { data, error } = await sb.from('blocks').select('*').order('blocked_at', { ascending: false });
+  if (error) { console.error('[Data] Deactivations:', error.message); return; }
+  _blocks = data.map(blockFromRow);
 }
 
 // Students only learn whether they're blocked, never the office's reason
 async function refreshBlockedState() {
-  if (!currentUser || currentUser.role !== 'student') { _studentBlocked = false; return; }
-  if (!_serverMode) {
-    _studentBlocked = false;
-    return;
-  }
-  try {
-    const res = await fetch('/api/blocks/status?email=' + encodeURIComponent(currentUser.email), { signal: AbortSignal.timeout(3000) });
-    if (res.ok) _studentBlocked = Boolean((await res.json()).blocked);
-  } catch { /* leave it as it was */ }
+  if (!sb || !currentUser || currentUser.role !== 'student') { _studentBlocked = false; return; }
+  const { data, error } = await sb.rpc('am_i_blocked');
+  if (!error) _studentBlocked = Boolean(data);
 }
 
 function activeBlocks() {
@@ -2907,22 +2783,22 @@ async function submitDeactivate(e) {
   if (!email && !regNo) { showToast('Enter the student\'s email or registration number.', 'error'); return; }
   if (reason.length < 5) { showToast('Please give a reason — it is kept in the record.', 'error'); return; }
   if (!document.getElementById('b-confirm').checked) { showToast('Please tick the confirmation box.', 'error'); return; }
-  if (!_serverMode) { showToast('Deactivating a student needs the portal server.', 'error'); return; }
 
   const btn = document.getElementById('block-submit');
   btn.disabled = true;
   try {
-    const res = await fetch('/api/blocks', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, regNo, reason, name: (_pendingBlock && _pendingBlock.name) || '', by: currentUser.email }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'Could not deactivate this student');
-    _blocks.push(data.block);
+    const { data, error } = await sb.from('blocks').insert({
+      emails: email ? [email] : [],
+      reg_nos: regNo ? [regNo] : [],
+      name: (_pendingBlock && _pendingBlock.name) || '',
+      reason,
+    }).select().single();
+    if (error) throw new Error(dbMessage(error));
+    const block = blockFromRow(data);
+    _blocks.unshift(block);
     closeModal('block-modal');
     renderAdminDashboard();
-    showToast(`Re-evaluation deactivated for ${data.block.emails.join(', ') || data.block.regNos.join(', ')}.`, 'success');
+    showToast(`Re-evaluation deactivated for ${block.emails.join(', ') || block.regNos.join(', ')}.`, 'success');
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
@@ -2937,14 +2813,10 @@ async function reactivateStudent(blockId) {
   if (!confirm(`Turn re-evaluation back on for ${who}?\n\nThey will be able to apply again in any open window.`)) return;
   const note = prompt('Note for the record (optional):', '') || '';
   try {
-    const res = await fetch(`/api/blocks/${encodeURIComponent(blockId)}/lift`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ by: currentUser.email, note }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || 'Could not reactivate');
-    Object.assign(block, data.block);
+    const { data, error } = await sb.from('blocks').update({ lifted_at: new Date().toISOString(), lift_note: note })
+      .eq('id', blockId).select().single();
+    if (error) throw new Error(dbMessage(error));
+    Object.assign(block, blockFromRow(data));
     renderAdminDashboard();
     showToast(`Re-evaluation reactivated for ${who}.`, 'success');
   } catch (err) {
@@ -2960,7 +2832,7 @@ function populateCreds() {
     <div class="cred-row">
       <span class="cred-name">${escapeHtml(name.replace('Prof. ', ''))}</span>
       <span class="cred-email" title="Click to log in as ${escapeHtml(name)}" data-email="${escapeHtml(email)}" data-name="${escapeHtml(name)}"
-        onclick="testLoginAsFaculty(this.dataset.email, this.dataset.name)">${escapeHtml(email)}</span>
+        onclick="devSignIn(this)">${escapeHtml(email)}</span>
     </div>`).join('');
 }
 
@@ -2972,22 +2844,31 @@ function populateAdminCreds() {
     <div class="cred-row">
       <span class="cred-name">${escapeHtml(a.name)}</span>
       <span class="cred-email" title="Click to log in as ${escapeHtml(a.name)}" data-email="${escapeHtml(a.email)}" data-name="${escapeHtml(a.name)}"
-        onclick="testLoginAsAdmin(this.dataset.email, this.dataset.name)">${escapeHtml(a.email)}</span>
+        onclick="devSignIn(this)">${escapeHtml(a.email)}</span>
     </div>`).join('');
 }
 
-function testLoginAsAdmin(email, name) {
-  currentUser = { email: email.toLowerCase(), name, role: 'admin', picture: '' };
-  localStorage.setItem('reval_session', JSON.stringify(currentUser));
-  openDashboardForRole();
-  showToast('DEV login: ' + name, 'info');
-}
-
-function testLoginAsFaculty(email, name) {
-  currentUser = { email: email.toLowerCase(), name: name, role: 'professor', picture: '' };
-  localStorage.setItem('reval_session', JSON.stringify(currentUser));
-  openDashboardForRole();
-  showToast('DEV login: ' + name, 'info');
+// ===== [DEV] TEST ACCOUNTS =====
+// The dummy admin and faculty accounts have no mailbox, so they sign in with a password. Each
+// is created in Supabase (Authentication → Users → Add user, "Auto Confirm User" ticked) and
+// listed in the test_accounts table. The session is real, so the database treats a dummy exactly
+// like the person it stands in for. The password is typed each time; it is never in this file.
+async function devSignIn(el) {
+  const input = el.closest('.creds-list').querySelector('.dev-password');
+  const password = input.value;
+  if (!password) { showToast('Enter the test password first.', 'error'); input.focus(); return; }
+  if (!sb) { showToast('Sign-in could not load. Check your internet connection and refresh.', 'error'); return; }
+  const email = el.dataset.email;
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) {
+    showToast(/invalid login/i.test(error.message)
+      ? `${email} isn't set up as a test account with that password.`
+      : 'Sign-in failed: ' + error.message, 'error');
+    return;
+  }
+  input.value = '';
+  await startSession(data.session);
+  showToast('Signed in as ' + currentUser.name, 'info');
 }
 
 function fillEmail() { }

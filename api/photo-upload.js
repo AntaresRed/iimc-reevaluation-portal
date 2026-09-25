@@ -6,13 +6,16 @@
  * browser. One photo per call: Vercel caps a request body at about 4.5 MB, and a batch of
  * phone pictures would sail past that.
  *
- * Body: { requestId, regNo, studentName, subject, examType, term, name, dataUrl }
+ * Body: { requestId, name, dataUrl }
  * Reply: { name, driveId, folderId }
+ *
+ * Only the student who raised the request may add photos, and only while it is still pending.
+ * The folder name comes from the request as stored in the database, not from the browser.
  */
 
 const drive = require('./_lib/drive.js');
 const { decodePhoto, safePhotoName } = require('./_lib/photos.js');
-const { requireUser } = require('./_lib/auth.js');
+const { requireUser, selectAsUser } = require('./_lib/auth.js');
 
 const MAX_BODY_BYTES = 6 * 1024 * 1024;
 
@@ -56,8 +59,18 @@ module.exports = async (req, res) => {
     const body = await readBody(req);
 
     const requestId = clean(body.requestId, 80);
-    if (!/^[A-Za-z0-9-]{1,80}$/.test(requestId)) {
+    if (!/^[0-9a-f-]{36}$/i.test(requestId)) {
       res.status(400).json({ error: 'Missing or malformed request id.' });
+      return;
+    }
+    const [stored] = await selectAsUser(user, `requests?id=eq.${requestId}` +
+      '&select=id,student_id,status,reg_no,student_name,subject,exam_type,term');
+    if (!stored || stored.student_id !== user.id) {
+      res.status(403).json({ error: 'You can only add photos to your own request.' });
+      return;
+    }
+    if (stored.status !== 'Pending') {
+      res.status(409).json({ error: 'Photos can only be added before the professor reviews the request.' });
       return;
     }
 
@@ -67,15 +80,14 @@ module.exports = async (req, res) => {
     // The folder is named from the request, so a student's photos stay together and the
     // sweep can delete the whole folder later.
     const windowInfo = {
-      term: clean(body.term, 40),
-      subject: clean(body.subject, 120),
-      examType: clean(body.examType, 60),
+      term: clean(stored.term, 40),
+      subject: clean(stored.subject, 120),
+      examType: clean(stored.exam_type, 60),
     };
     const requestInfo = {
       id: requestId,
-      regNo: clean(body.regNo, 40),
-      // Trust the signed-in address over anything the form claims
-      studentName: clean(body.studentName, 120) || user.email,
+      regNo: clean(stored.reg_no, 40),
+      studentName: clean(stored.student_name, 120) || user.email,
     };
 
     const uploaded = await drive.uploadRequestPhotos(requestInfo, windowInfo,

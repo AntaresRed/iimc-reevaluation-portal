@@ -167,6 +167,9 @@ create table if not exists public.requests (
 -- Added after the first release; brings an existing database up to date
 alter table public.requests add column if not exists original_marks text;
 alter table public.requests add column if not exists question_marks jsonb;
+-- Photo retention: the daily job deletes a decided request's photos after 30 days and notes it here
+alter table public.requests add column if not exists photos_deleted_at timestamptz;
+alter table public.requests add column if not exists photo_count_before_deletion int not null default 0;
 -- "Marks Changed" (any question moved) replaced Increased / Decreased for new decisions
 alter table public.requests drop constraint if exists requests_status_check;
 alter table public.requests add constraint requests_status_check
@@ -181,6 +184,9 @@ create table if not exists public.question_items (
   reason      text not null,
   unique (request_id, position)
 );
+
+-- How many photos this question had, recorded when the daily job deletes them
+alter table public.question_items add column if not exists photo_count int not null default 0;
 
 -- One row per photo; the file itself lives in Google Drive
 create table if not exists public.question_photos (
@@ -288,6 +294,10 @@ $$;
 create or replace function public.requests_before_update()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
+  -- The daily photo job runs with the service key and only records that photos were deleted
+  if coalesce(auth.jwt() ->> 'role', '') = 'service_role' then
+    return new;
+  end if;
   if not (public.my_prof_name() = any (old.professor_names)) then
     raise exception 'Only a professor for this request can record a decision.';
   end if;
@@ -335,6 +345,12 @@ $$;
 create or replace function public.requests_after_update()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
+  -- Photo deletion and other bookkeeping are logged by whoever does them
+  if new.status is not distinct from old.status
+     and new.professor_remarks is not distinct from old.professor_remarks
+     and new.question_marks is not distinct from old.question_marks then
+    return new;
+  end if;
   insert into public.request_history (request_id, event, by_email, from_status, to_status, note)
   values (new.id,
           case when old.status = new.status then 'Remarks updated' else 'Status changed' end,
@@ -359,6 +375,24 @@ drop trigger if exists requests_after_update on public.requests;
 create trigger requests_after_update after update on public.requests
   for each row execute function public.requests_after_update();
 
+-- --------------------------------------------------------- test accounts
+-- The dummy admin and faculty accounts used for testing have no real mailbox, so they sign in
+-- with a password instead of Google. Only addresses listed here may have a password account,
+-- and only when created already confirmed (Supabase → Authentication → Users → Add user, with
+-- "Auto Confirm User" ticked). A stranger signing up with a password is refused, so nobody can
+-- claim a professor's or student's address. Delete these rows and users before real use.
+create table if not exists public.test_accounts (
+  email       text primary key,
+  note        text,
+  added_at    timestamptz not null default now()
+);
+
+insert into public.test_accounts (email, note) values
+  ('mbaoffice@email.iimcal.ac.in', 'Dummy admin: MBA Office'),
+  ('examcell@email.iimcal.ac.in', 'Dummy admin: Exam Cell'),
+  ('dharmaraju.bathini@email.iimcal.ac.in', 'Dummy professor for testing')
+on conflict (email) do nothing;
+
 -- ------------------------------------------- a profile for every new sign-in
 -- Also the domain gate: only @email.iimcal.ac.in accounts can exist at all.
 create or replace function public.handle_new_user()
@@ -366,6 +400,11 @@ returns trigger language plpgsql security definer set search_path = public as $$
 begin
   if lower(new.email) not like '%@email.iimcal.ac.in' then
     raise exception 'Only @email.iimcal.ac.in accounts can use this portal.';
+  end if;
+  if coalesce(new.raw_app_meta_data ->> 'provider', '') = 'email'
+     and (new.email_confirmed_at is null
+          or not exists (select 1 from public.test_accounts t where t.email = lower(new.email))) then
+    raise exception 'Password sign-in is only for the portal''s test accounts.';
   end if;
   insert into public.profiles (id, email, full_name)
   values (new.id, lower(new.email), coalesce(new.raw_user_meta_data ->> 'full_name', new.raw_user_meta_data ->> 'name'))
@@ -391,6 +430,7 @@ alter table public.question_items  enable row level security;
 alter table public.question_photos enable row level security;
 alter table public.request_history enable row level security;
 alter table public.blocks          enable row level security;
+alter table public.test_accounts   enable row level security;
 
 -- profiles: your own, plus everything for admins
 drop policy if exists profiles_select on public.profiles;
@@ -450,7 +490,8 @@ create policy question_items_select on public.question_items for select to authe
 
 drop policy if exists question_items_insert on public.question_items;
 create policy question_items_insert on public.question_items for insert to authenticated
-  with check (exists (select 1 from public.requests r where r.id = request_id and r.student_id = auth.uid()));
+  with check (exists (select 1 from public.requests r
+                       where r.id = request_id and r.student_id = auth.uid() and r.status = 'Pending'));
 
 drop policy if exists question_photos_select on public.question_photos;
 create policy question_photos_select on public.question_photos for select to authenticated
@@ -462,7 +503,7 @@ drop policy if exists question_photos_insert on public.question_photos;
 create policy question_photos_insert on public.question_photos for insert to authenticated
   with check (exists (
     select 1 from public.question_items qi join public.requests r on r.id = qi.request_id
-     where qi.id = question_item_id and r.student_id = auth.uid()));
+     where qi.id = question_item_id and r.student_id = auth.uid() and r.status = 'Pending'));
 
 -- history is readable with the request, and only ever written by the triggers
 drop policy if exists request_history_select on public.request_history;
@@ -490,6 +531,16 @@ declare
   extra_emails text[];
   extra_regs   text[];
 begin
+  if tg_op = 'INSERT' then
+    new.blocked_by := public.current_email();
+    new.blocked_at := now();
+    new.lifted_at  := null;
+    new.lifted_by  := null;
+    new.lift_note  := null;
+  elsif new.lifted_at is not null and old.lifted_at is null then
+    new.lifted_at := now();
+    new.lifted_by := public.current_email();
+  end if;
   new.emails  := coalesce((select array_agg(distinct lower(e)) from unnest(new.emails) e where e <> ''), '{}');
   new.reg_nos := coalesce((select array_agg(distinct public.norm_reg_no(r)) from unnest(new.reg_nos) r where r <> ''), '{}');
 
@@ -509,3 +560,99 @@ $$;
 drop trigger if exists blocks_before_write on public.blocks;
 create trigger blocks_before_write before insert or update on public.blocks
   for each row execute function public.blocks_before_write();
+
+-- ============================================================================
+--  The page works on this database directly
+-- ============================================================================
+
+-- test accounts: only admins can see the list
+drop policy if exists test_accounts_select on public.test_accounts;
+create policy test_accounts_select on public.test_accounts for select to authenticated
+  using (public.is_admin());
+
+-- Windows: who opened or last changed one is recorded here, not taken from the browser
+create or replace function public.windows_before_write()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  if tg_op = 'INSERT' then
+    new.created_by := public.current_email();
+    new.created_at := now();
+    new.updated_by := null;
+    new.updated_at := null;
+  else
+    new.created_by := old.created_by;
+    new.created_at := old.created_at;
+    new.updated_by := public.current_email();
+    new.updated_at := now();
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists windows_before_write on public.windows;
+create trigger windows_before_write before insert or update on public.windows
+  for each row execute function public.windows_before_write();
+
+-- Faculty added from the window form: tidy the address and record who added them
+create or replace function public.faculty_before_insert()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  new.email    := lower(btrim(new.email));
+  new.name     := btrim(new.name);
+  new.added_by := public.current_email();
+  new.added_at := now();
+  if new.email not like '%@email.iimcal.ac.in' then
+    raise exception 'Please enter the professor''s @email.iimcal.ac.in address.';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists faculty_before_insert on public.faculty;
+create trigger faculty_before_insert before insert on public.faculty
+  for each row execute function public.faculty_before_insert();
+
+-- A student's request and its questions are saved together, or not at all.
+-- Runs as the student, so every rule above still applies; the triggers fill in the rest.
+create or replace function public.submit_request(
+  p_window_id uuid, p_student_name text, p_reg_no text, p_section text, p_items jsonb)
+returns uuid language plpgsql security invoker set search_path = public as $$
+declare
+  new_id uuid;
+  item   jsonb;
+  pos    int := 0;
+begin
+  if coalesce(btrim(p_student_name), '') = '' then
+    raise exception 'Please enter your name.';
+  end if;
+  if coalesce(btrim(p_reg_no), '') = '' then
+    raise exception 'Please enter your registration number.';
+  end if;
+  if jsonb_typeof(p_items) is distinct from 'array' or jsonb_array_length(p_items) = 0 then
+    raise exception 'Add at least one question.';
+  end if;
+  if jsonb_array_length(p_items) > 10 then
+    raise exception 'You can add at most 10 questions.';
+  end if;
+  if exists (select 1 from public.requests r where r.window_id = p_window_id and r.student_id = auth.uid()) then
+    raise exception 'You have already applied in this window.';
+  end if;
+
+  insert into public.requests (window_id, student_id, student_email, student_name, reg_no, section,
+                               professor_names, subject, exam_type, term)
+  values (p_window_id, auth.uid(), public.current_email(), left(btrim(p_student_name), 120),
+          left(btrim(p_reg_no), 40), coalesce(p_section, ''), '{}', '', '', '')
+  returning id into new_id;
+
+  for item in select value from jsonb_array_elements(p_items) loop
+    pos := pos + 1;
+    if coalesce(btrim(item ->> 'question'), '') = '' or coalesce(btrim(item ->> 'reason'), '') = '' then
+      raise exception 'Question % needs its number and a reason.', pos;
+    end if;
+    insert into public.question_items (request_id, position, question, reason)
+    values (new_id, pos, left(btrim(item ->> 'question'), 40), left(btrim(item ->> 'reason'), 3000));
+  end loop;
+
+  return new_id;
+end;
+$$;

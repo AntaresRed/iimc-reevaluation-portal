@@ -1,16 +1,15 @@
 /**
- * GET /api/photo-get?id=<drive file id>
+ * GET /api/photo-get?id=<drive file id>   (with the caller's Supabase token)
  *
  * Streams one question photo back from Drive. The files are private to the portal's Google
  * account and are never shared by link, so this is the only way to see them.
  *
- * The portal holds the scope drive.file, which reaches only files this app itself created.
- * Even so this endpoint hands out a photo to anyone who knows its id. Ids are opaque and
- * never published, but once re-evaluation requests live in Supabase this should check that
- * the caller is the student who submitted it or the professor reviewing it.
+ * A photo is handed over only if the caller may see its request: the student who raised it,
+ * the professors deciding it, or an admin. The database's own rules decide that.
  */
 
 const drive = require('./_lib/drive.js');
+const { requireUser, selectAsUser } = require('./_lib/auth.js');
 
 const EXT_TYPES = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' };
 
@@ -30,6 +29,18 @@ module.exports = async (req, res) => {
 
   if (!/^[A-Za-z0-9_-]{10,200}$/.test(id)) {
     res.status(400).json({ error: 'Not a photo id.' });
+    return;
+  }
+
+  try {
+    const user = await requireUser(req);
+    const visible = await selectAsUser(user, `question_photos?drive_id=eq.${encodeURIComponent(id)}&select=id`);
+    if (!visible.length) {
+      res.status(404).json({ error: 'That photo is not available to you.' });
+      return;
+    }
+  } catch (e) {
+    res.status(e.status || 401).json({ error: e.message });
     return;
   }
 

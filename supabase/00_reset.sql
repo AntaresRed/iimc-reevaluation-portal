@@ -14,6 +14,7 @@ drop trigger if exists on_auth_user_created on auth.users;
 drop function if exists public.can_see_request(public.requests) cascade;
 drop function if exists public.window_state(public.windows) cascade;
 
+drop table if exists public.test_accounts   cascade;
 drop table if exists public.request_history cascade;
 drop table if exists public.question_photos cascade;
 drop table if exists public.question_items  cascade;
@@ -26,6 +27,9 @@ drop table if exists public.app_admins      cascade;
 drop table if exists public.profiles        cascade;
 
 drop function if exists public.handle_new_user() cascade;
+drop function if exists public.submit_request(uuid, text, text, text, jsonb) cascade;
+drop function if exists public.windows_before_write() cascade;
+drop function if exists public.faculty_before_insert() cascade;
 drop function if exists public.requests_before_insert() cascade;
 drop function if exists public.requests_after_insert() cascade;
 drop function if exists public.requests_before_update() cascade;

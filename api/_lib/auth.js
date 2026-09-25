@@ -68,7 +68,7 @@ async function requireUser(req) {
   const header = String(req.headers.authorization || '');
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token) {
-    const e = new Error('Please sign in again before uploading.');
+    const e = new Error('Please sign in again.');
     e.status = 401;
     throw e;
   }
@@ -86,11 +86,29 @@ async function requireUser(req) {
 
   const email = String(res.body.email).toLowerCase();
   if (!email.endsWith('@' + ALLOWED_DOMAIN)) {
-    const e = new Error('Only ' + ALLOWED_DOMAIN + ' accounts may upload.');
+    const e = new Error('Only ' + ALLOWED_DOMAIN + ' accounts can use the portal.');
     e.status = 403;
     throw e;
   }
-  return { email, id: res.body.id };
+  return { email, id: res.body.id, token };
 }
 
-module.exports = { requireUser, SUPABASE_URL, ALLOWED_DOMAIN };
+/**
+ * Reads from the database as the signed-in person (`user` from requireUser), so row-level
+ * security decides what comes back — exactly what the page itself would be allowed to see.
+ * `query` is a PostgREST path such as "requests?id=eq.…&select=id".
+ */
+async function selectAsUser(user, query) {
+  const res = await getJson(`${SUPABASE_URL}/rest/v1/${query}`, {
+    apikey: assertHeaderSafe('SUPABASE_ANON_KEY', SUPABASE_ANON_KEY),
+    Authorization: `Bearer ${assertHeaderSafe('the sign-in token', user.token.replace(/\s+/g, ''))}`,
+  });
+  if (res.status !== 200 || !Array.isArray(res.body)) {
+    const e = new Error('Could not check that with the database. Please try again.');
+    e.status = 502;
+    throw e;
+  }
+  return res.body;
+}
+
+module.exports = { requireUser, selectAsUser, SUPABASE_URL, ALLOWED_DOMAIN };

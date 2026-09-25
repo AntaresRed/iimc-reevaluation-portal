@@ -342,6 +342,19 @@ body {
   border-radius: 4px;
 }
 
+.dev-password {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  outline: none;
+}
+.dev-password:focus { border-color: var(--iim-brown); }
+
 .cred-row {
   display: flex;
   justify-content: space-between;
