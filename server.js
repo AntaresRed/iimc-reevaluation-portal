@@ -612,6 +612,7 @@ async function handleSubmitRequest(req, res) {
       questionItems,
       status: 'Pending',
       createdAt: now,
+      originalMarks: null,
       updatedMarks: null,
       professorRemarks: null,
       history: [{ at: now, event: 'Submitted', by: email, note: '' }],
@@ -792,9 +793,12 @@ async function handleRequestActions(req, res) {
     if (!REVIEW_STATUSES.includes(status)) { sendJson(res, 400, { error: 'Invalid status.' }); return true; }
     const remarks = String(body.professorRemarks || '').trim().slice(0, 5000);
     if (!remarks) { sendJson(res, 400, { error: 'Remarks are required.' }); return true; }
+    const originalMarks = cleanText(body.originalMarks, 500);
+    if (!originalMarks) { sendJson(res, 400, { error: 'Original marks are required.' }); return true; }
 
     const oldStatus = request.status;
     const by = cleanText(body.by, 200) || '—';
+    request.originalMarks = originalMarks;
     request.updatedMarks = cleanText(body.updatedMarks, 500) || null;
     request.professorRemarks = remarks;
     request.status = status;

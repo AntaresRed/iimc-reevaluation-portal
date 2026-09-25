@@ -889,22 +889,29 @@ function photoNoteHtml(r, inHistory, hadPhotos) {
   return '';
 }
 
+// The professor's decision: original → updated marks, then the remarks
+function decisionHtml(r, title = "Professor's Decision") {
+  if (!r.originalMarks && !r.updatedMarks && !r.professorRemarks) return '';
+  const boxClass = r.status.includes('Increased') ? '' : r.status.includes('Decreased') ? ' result-decreased' : ' result-nochange';
+  const marks = [
+    r.originalMarks ? `<div class="result-marks-row"><label>Original</label><span class="result-marks result-marks-original">${escapeHtml(r.originalMarks)}</span></div>` : '',
+    r.updatedMarks ? `<div class="result-marks-row"><label>Updated</label><span class="result-marks">${escapeHtml(r.updatedMarks)}</span></div>` : '',
+  ].join('');
+  return `
+    <div class="result-box${boxClass}">
+      <h5>${title}</h5>
+      ${marks}
+      ${r.professorRemarks ? `<div class="result-remarks">${escapeHtml(r.professorRemarks)}</div>` : ''}
+    </div>`;
+}
+
 function openStudentDetail(id) {
   const r = getRequests().find(x => x.id === id);
   if (!r) return;
   const inHistory = isInHistory(r);
   const hadPhotos = (r.questionItems || []).some(q => q.photos && q.photos.length);
 
-  let resultHtml = '';
-  if (r.updatedMarks || r.professorRemarks) {
-    const boxClass = r.status.includes('Increased') ? '' : r.status.includes('Decreased') ? ' result-decreased' : ' result-nochange';
-    resultHtml = `
-    <div class="result-box${boxClass}">
-      <h5>Professor's Decision</h5>
-      ${r.updatedMarks ? `<span class="result-marks">${escapeHtml(r.updatedMarks)}</span>` : ''}
-      ${r.professorRemarks ? `<div class="result-remarks">${escapeHtml(r.professorRemarks)}</div>` : ''}
-    </div>`;
-  }
+  const resultHtml = decisionHtml(r);
 
   document.getElementById('student-detail-body').innerHTML = `
     <div class="detail-section">
@@ -1005,6 +1012,7 @@ async function submitRevalForm(e) {
     questionItems: collected.items,
     status: 'Pending',
     createdAt: now,
+    originalMarks: null,
     updatedMarks: null,
     professorRemarks: null,
     history: [{ at: now, event: 'Submitted', by: currentUser.email, note: '' }],
@@ -1149,6 +1157,7 @@ function openProfReview(id) {
       ${questionListHtml(r)}
     </div>`;
 
+  document.getElementById('p-original-marks').value = r.originalMarks || '';
   document.getElementById('p-marks').value = r.updatedMarks || '';
   document.getElementById('p-remarks').value = r.professorRemarks || '';
   document.getElementById('p-status').value = r.status !== 'Pending' ? r.status : 'Under Review';
@@ -1164,9 +1173,11 @@ function openProfReview(id) {
 }
 
 async function submitProfReview() {
+  const originalMarks = document.getElementById('p-original-marks').value.trim();
   const marks = document.getElementById('p-marks').value.trim();
   const remarks = document.getElementById('p-remarks').value.trim();
   const status = document.getElementById('p-status').value;
+  if (!originalMarks) { showToast('Please enter the original marks.', 'error'); return; }
   if (!remarks) { showToast('Please enter remarks/explanation.', 'error'); return; }
 
   // Server mode: the server records the decision
@@ -1177,7 +1188,7 @@ async function submitProfReview() {
     btn.textContent = 'Saving...';
     try {
       const r = await postRequestAction(currentProfRequestId, 'review', {
-        status, updatedMarks: marks, professorRemarks: remarks, by: currentUser.email,
+        status, originalMarks, updatedMarks: marks, professorRemarks: remarks, by: currentUser.email,
       });
       closeModal('prof-review-modal');
       renderProfStats();
@@ -1197,6 +1208,7 @@ async function submitProfReview() {
   if (idx === -1) return;
 
   const oldStatus = requests[idx].status;
+  requests[idx].originalMarks = originalMarks;
   requests[idx].updatedMarks = marks || null;
   requests[idx].professorRemarks = remarks;
   requests[idx].status = status;
@@ -1236,7 +1248,7 @@ function loadDemoData() {
       reason: 'I believe Q2(b) was marked incorrectly — the formula I used yields the right answer by an alternate approach. For Q4, partial credit was not awarded for the correct methodology.',
       status: 'Pending',
       createdAt: Date.now() - 2 * 24 * 60 * 60 * 1000,
-      updatedMarks: null, professorRemarks: null,
+      originalMarks: null, updatedMarks: null, professorRemarks: null,
     },
     {
       id: generateId(),
@@ -1252,7 +1264,7 @@ function loadDemoData() {
       reason: 'The demand-supply analysis in Q7 was based on the correct model discussed in class. Q9 graphical answer was accurate.',
       status: 'Pending',
       createdAt: Date.now() - 5 * 24 * 60 * 60 * 1000,
-      updatedMarks: null, professorRemarks: null,
+      originalMarks: null, updatedMarks: null, professorRemarks: null,
     },
     {
       id: generateId(),
@@ -1268,7 +1280,7 @@ function loadDemoData() {
       reason: 'My interpretation of Q1 aligns with the framework covered in Week 6 slides. I am requesting a re-check of Q3 as well.',
       status: 'Under Review',
       createdAt: Date.now() - 7 * 24 * 60 * 60 * 1000,
-      updatedMarks: null, professorRemarks: null,
+      originalMarks: null, updatedMarks: null, professorRemarks: null,
     }
   ];
 
@@ -1499,8 +1511,12 @@ function openWindowDetail(id) {
       : hasAppliedInWindow(w.id)
       ? '<button class="btn-secondary" disabled>✓ Applied</button>'
       : `<button class="btn-primary" onclick="closeModal('window-detail-modal'); showStudentForm('${w.id}')">Apply for Re-evaluation</button>`;
-  } else if (role === 'admin' && state !== 'closed') {
-    actions = `
+  } else if (role === 'admin') {
+    const count = requestsInWindow(w.id).length;
+    actions = count
+      ? `<button class="btn-secondary" onclick="closeModal('window-detail-modal'); showWindowRequests('${w.id}')">View ${count} request${count === 1 ? '' : 's'}</button>`
+      : '';
+    if (state !== 'closed') actions += `
       <button class="btn-secondary" onclick="closeModal('window-detail-modal'); endWindow('${w.id}')">${state === 'open' ? 'End now' : 'Cancel window'}</button>
       <button class="btn-primary" onclick="closeModal('window-detail-modal'); showWindowForm('${w.id}')">Edit Window</button>`;
   }
@@ -1615,6 +1631,7 @@ function initAdminDashboard() {
 function renderAdminDashboard() {
   renderAdminStats();
   if (_adminView === 'students') renderAdminStudents();
+  else if (_adminView === 'requests') renderAdminRequests();
   else if (_adminView === 'fees') renderAdminFees();
   else renderAdminWindows(currentAdminTab);
 }
@@ -2533,12 +2550,14 @@ function switchAdminView(view) {
   _adminView = view;
   document.querySelectorAll('#admin-view-switch .view-btn').forEach(b => b.classList.toggle('active', b.dataset.view === view));
   document.getElementById('admin-windows-view').style.display = view === 'windows' ? '' : 'none';
+  document.getElementById('admin-requests-view').style.display = view === 'requests' ? '' : 'none';
   document.getElementById('admin-students-view').style.display = view === 'students' ? '' : 'none';
   document.getElementById('admin-fees-view').style.display = view === 'fees' ? '' : 'none';
   // The window counters belong to the windows and students views; the fees view brings its own
   document.getElementById('admin-stats').style.display = view === 'fees' ? 'none' : '';
   const heading = {
     windows: ['Re-Evaluation Windows', 'Students can only apply for re-evaluation while a window is open for their exam and section.'],
+    requests: ['All Requests', 'Every re-evaluation request raised, in every window — open, closed or past.'],
     students: ['Students', 'Everyone who has applied, what they owe, and who is currently deactivated.'],
     fees: ['Fees Register', 'Every re-evaluation that ended with the marks unchanged — those are the ones the student pays for.'],
   }[view];
@@ -2597,6 +2616,142 @@ function renderAdminStudents() {
         </div>
       </div>`).join('');
   }
+}
+
+// ===== ALL REQUESTS (admin) =====
+// Every request ever raised, filterable by status, window and term, with a read-only detail view.
+function windowOptionLabel(w) {
+  return `${w.subject} · ${w.examType} · ${w.term}` + (w.sections.length ? ` · Sec ${w.sections.join(', ')}` : '');
+}
+
+// Refill a <select>, keeping the current choice when it still exists
+function fillSelect(el, options) {
+  const current = el.value;
+  el.innerHTML = options.map(([value, label]) => `<option value="${escapeHtml(value)}">${escapeHtml(label)}</option>`).join('');
+  el.value = options.some(([value]) => value === current) ? current : '';
+}
+
+function fillRequestFilters() {
+  const ws = getWindows().slice().sort((a, b) => b.startsAt - a.startsAt);
+  const windowOpts = [['', 'All windows'], ...ws.map(w => [w.id, windowOptionLabel(w)])];
+  if (getRequests().some(r => !ws.some(w => w.id === r.windowId))) windowOpts.push(['none', 'No window on record']);
+  fillSelect(document.getElementById('req-window'), windowOpts);
+
+  const terms = [...new Set(getRequests().map(r => r.term).filter(Boolean))].sort().reverse();
+  fillSelect(document.getElementById('req-term'), [['', 'All terms'], ...terms.map(t => [t, t])]);
+}
+
+function filteredAdminRequests() {
+  const search = (document.getElementById('req-search').value || '').trim().toLowerCase();
+  const status = document.getElementById('req-status').value;
+  const windowId = document.getElementById('req-window').value;
+  const term = document.getElementById('req-term').value;
+  const windowIds = new Set(getWindows().map(w => w.id));
+  return getRequests().filter(r =>
+    (!status || (status === 'resolved' ? r.status.startsWith('Resolved') : r.status === status)) &&
+    (!windowId || (windowId === 'none' ? !windowIds.has(r.windowId) : r.windowId === windowId)) &&
+    (!term || r.term === term) &&
+    (!search || [r.studentName, r.studentEmail, r.regNo, r.subject, r.courseCode, r.professorName, r.id]
+      .some(v => (v || '').toLowerCase().includes(search)))
+  ).sort((a, b) => b.createdAt - a.createdAt);
+}
+
+function renderAdminRequests() {
+  fillRequestFilters();
+  const rows = filteredAdminRequests();
+  const total = getRequests().length;
+  document.getElementById('req-count').textContent = rows.length === total
+    ? `${total} request${total === 1 ? '' : 's'}`
+    : `Showing ${rows.length} of ${total} requests`;
+
+  const body = document.getElementById('req-tbody');
+  if (!rows.length) {
+    body.innerHTML = `<tr><td colspan="6" class="students-empty">${total ? 'No request matches these filters.' : 'No requests have been raised yet.'}</td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => `
+    <tr class="req-row" data-id="${escapeHtml(r.id)}" onclick="openAdminRequest(this.dataset.id)" title="View details">
+      <td class="req-date">${formatDateTime(r.createdAt)}</td>
+      <td>
+        <div class="student-name">${escapeHtml(r.studentName)}</div>
+        <div class="student-email">${escapeHtml(r.regNo)} · ${escapeHtml(r.studentEmail)}</div>
+      </td>
+      <td>
+        <div class="student-name">${escapeHtml(r.subject)}</div>
+        <div class="student-email">${escapeHtml(r.examType)} · ${escapeHtml(r.term || '—')}</div>
+      </td>
+      <td>${escapeHtml(r.section || '—')}</td>
+      <td>${escapeHtml(r.professorName || '—')}</td>
+      <td>${getBadge(r.status)}</td>
+    </tr>`).join('');
+}
+
+// Opened from a window's details: the requests view, narrowed to that window
+function showWindowRequests(windowId) {
+  document.getElementById('req-search').value = '';
+  document.getElementById('req-status').value = '';
+  document.getElementById('req-term').value = '';
+  fillRequestFilters();
+  document.getElementById('req-window').value = windowId;
+  switchAdminView('requests');
+}
+
+function openAdminRequest(id) {
+  const r = getRequests().find(x => x.id === id);
+  if (!r) return;
+  const w = getWindows().find(x => x.id === r.windowId);
+  const decision = decisionHtml(r, "Professor's Decision" + (r.reviewedAt ? ' · ' + formatDateTime(r.reviewedAt) : ''));
+
+  document.getElementById('ar-sub').innerHTML = `${getBadge(r.status)} Submitted ${formatDateTime(r.createdAt)}`;
+  document.getElementById('ar-body').innerHTML = `
+    <div class="detail-section">
+      <h4>Request Information</h4>
+      <div class="detail-grid">
+        <div class="detail-item"><label>Student</label><span>${escapeHtml(r.studentName)}</span></div>
+        <div class="detail-item"><label>Email</label><span>${escapeHtml(r.studentEmail)}</span></div>
+        <div class="detail-item"><label>Registration No.</label><span>${escapeHtml(r.regNo)}</span></div>
+        <div class="detail-item"><label>Section</label><span>${escapeHtml(r.section || '—')}</span></div>
+        <div class="detail-item"><label>Subject</label><span>${escapeHtml(r.subject)}${r.courseCode ? ' (' + escapeHtml(r.courseCode) + ')' : ''}</span></div>
+        <div class="detail-item"><label>Exam Type</label><span>${escapeHtml(r.examType)}</span></div>
+        <div class="detail-item"><label>Term</label><span>${escapeHtml(r.term || '—')}</span></div>
+        <div class="detail-item"><label>Professor</label><span>${escapeHtml(r.professorName || '—')}</span></div>
+        <div class="detail-item"><label>Window</label><span>${w
+          ? `<a href="#" onclick="event.preventDefault(); closeModal('admin-request-modal'); openWindowDetail('${w.id}')">${escapeHtml(windowOptionLabel(w))}</a>`
+          : '—'}</span></div>
+        <div class="detail-item"><label>Request ID</label><span style="font-family:monospace;font-size:12px">${escapeHtml(r.id)}</span></div>
+      </div>
+    </div>
+    <div class="detail-section">
+      <h4>Questions</h4>
+      ${questionListHtml(r)}
+    </div>
+    ${decision}
+    ${renderHistoryTimeline(r)}`;
+  openModal('admin-request-modal');
+}
+
+// The filtered list as a spreadsheet, for the exam cell's records
+function exportAdminRequests() {
+  const rows = filteredAdminRequests();
+  if (!rows.length) { showToast('There are no requests to export.', 'info'); return; }
+  const cell = v => {
+    const text = String(v == null ? '' : v);
+    return /[",\r\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+  };
+  const when = ts => ts ? new Date(ts).toLocaleString('en-IN') : '';
+  const header = ['Request ID', 'Submitted', 'Student', 'Email', 'Registration No.', 'Subject', 'Course Code', 'Exam Type',
+    'Term', 'Section', 'Professor', 'Questions', 'Status', 'Original Marks', 'Updated Marks', 'Remarks', 'Decided'];
+  const lines = [header, ...rows.map(r => [r.id, when(r.createdAt), r.studentName, r.studentEmail, r.regNo, r.subject,
+    r.courseCode, r.examType, r.term, r.section, r.professorName, r.questions, r.status, r.originalMarks,
+    r.updatedMarks,
+    r.professorRemarks, when(r.reviewedAt)])].map(line => line.map(cell).join(','));
+  // The byte-order mark makes Excel read ₹ and names with accents correctly
+  const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `reevaluation-requests-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 function showDeactivateForm(email, regNo, name) {

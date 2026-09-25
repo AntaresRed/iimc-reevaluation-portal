@@ -152,12 +152,16 @@ create table if not exists public.requests (
   status            text not null default 'Pending'
                     check (status in ('Pending','Under Review','Resolved - Marks Increased',
                                       'Resolved - Marks Decreased','Resolved - No Change')),
+  original_marks    text,
   updated_marks     text,
   professor_remarks text,
   reviewed_at       timestamptz,
   created_at        timestamptz not null default now(),
   unique (window_id, student_id)          -- one request per student per window
 );
+
+-- Added after the first release; brings an existing database up to date
+alter table public.requests add column if not exists original_marks text;
 
 create table if not exists public.question_items (
   id          uuid primary key default gen_random_uuid(),
@@ -250,6 +254,7 @@ begin
   new.exam_type   := w.exam_type;
   new.term        := w.term;
   new.status      := 'Pending';
+  new.original_marks := null;
   new.updated_marks := null;
   new.professor_remarks := null;
   new.reviewed_at := null;
@@ -267,12 +272,12 @@ begin
 end;
 $$;
 
--- Any professor of the request (or an admin) may record a decision, and only
--- the decision fields may change.
+-- Only a professor of the request may record a decision (admins can see it but not change it),
+-- and only the decision fields may change.
 create or replace function public.requests_before_update()
 returns trigger language plpgsql security definer set search_path = public as $$
 begin
-  if not (public.my_prof_name() = any (old.professor_names) or public.is_admin()) then
+  if not (public.my_prof_name() = any (old.professor_names)) then
     raise exception 'Only a professor for this request can record a decision.';
   end if;
   if new.window_id <> old.window_id or new.student_id <> old.student_id
@@ -280,6 +285,9 @@ begin
      or new.term <> old.term or new.section is distinct from old.section
      or new.professor_names <> old.professor_names or new.reg_no <> old.reg_no then
     raise exception 'Only the marks, remarks and status of a request can change.';
+  end if;
+  if coalesce(new.original_marks, '') = '' then
+    raise exception 'Original marks are required.';
   end if;
   if coalesce(new.professor_remarks, '') = '' then
     raise exception 'Remarks are required.';
@@ -397,8 +405,8 @@ create policy requests_insert on public.requests for insert to authenticated
 
 drop policy if exists requests_update on public.requests;
 create policy requests_update on public.requests for update to authenticated
-  using (public.my_prof_name() = any (professor_names) or public.is_admin())
-  with check (public.my_prof_name() = any (professor_names) or public.is_admin());
+  using (public.my_prof_name() = any (professor_names))
+  with check (public.my_prof_name() = any (professor_names));
 
 -- questions and photos follow whatever the parent request allows
 drop policy if exists question_items_select on public.question_items;

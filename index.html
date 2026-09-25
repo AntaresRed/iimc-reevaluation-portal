@@ -312,9 +312,15 @@
             <h4>Professor's Decision</h4>
             <div class="form-grid-2">
               <div class="form-group">
+                <label>Original Marks (per question) *</label>
+                <input type="text" id="p-original-marks" placeholder="e.g. Q2: 6/10, Q4: 10/15" />
+              </div>
+              <div class="form-group">
                 <label>Updated Marks (per question)</label>
                 <input type="text" id="p-marks" placeholder="e.g. Q2: 8/10, Q4: 12/15" />
               </div>
+            </div>
+            <div class="form-grid-2">
               <div class="form-group">
                 <label>Final Status</label>
                 <select id="p-status">
@@ -371,6 +377,7 @@
 
       <div class="view-switch" id="admin-view-switch">
         <button type="button" class="view-btn active" data-view="windows" onclick="switchAdminView('windows')">🗓️ Windows</button>
+        <button type="button" class="view-btn" data-view="requests" onclick="switchAdminView('requests')">📋 Requests</button>
         <button type="button" class="view-btn" data-view="students" onclick="switchAdminView('students')">🎓 Students</button>
         <button type="button" class="view-btn" data-view="fees" onclick="switchAdminView('fees')">₹ Fees</button>
       </div>
@@ -385,6 +392,41 @@
           <button class="tab" onclick="switchAdminTab('all', this)">All</button>
         </div>
         <div class="requests-grid" id="admin-windows-grid"></div>
+      </div>
+
+      <div id="admin-requests-view" style="display:none">
+        <div class="students-toolbar req-toolbar">
+          <input type="search" id="req-search" placeholder="Search by student, email, reg. no., subject, professor or ID…"
+            oninput="renderAdminRequests()" />
+          <select id="req-status" onchange="renderAdminRequests()">
+            <option value="">All statuses</option>
+            <option value="Pending">Pending</option>
+            <option value="Under Review">Under Review</option>
+            <option value="resolved">Resolved (any)</option>
+            <option value="Resolved - Marks Increased">Marks increased</option>
+            <option value="Resolved - Marks Decreased">Marks decreased</option>
+            <option value="Resolved - No Change">No change</option>
+          </select>
+          <select id="req-window" onchange="renderAdminRequests()"></select>
+          <select id="req-term" onchange="renderAdminRequests()"></select>
+          <button type="button" class="btn-secondary btn-end" onclick="exportAdminRequests()">⬇ Export CSV</button>
+        </div>
+        <p class="req-count" id="req-count"></p>
+        <div class="students-table-wrap">
+          <table class="students-table req-table">
+            <thead>
+              <tr>
+                <th>Submitted</th>
+                <th>Student</th>
+                <th>Subject / Exam</th>
+                <th>Sec</th>
+                <th>Professor</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="req-tbody"></tbody>
+          </table>
+        </div>
       </div>
 
       <div id="admin-students-view" style="display:none">
@@ -561,6 +603,19 @@
         <button class="modal-close" onclick="closeModal('window-detail-modal')">✕</button>
       </div>
       <div class="modal-body" id="wd-body"></div>
+    </div>
+  </div>
+
+  <div id="admin-request-modal" class="modal-overlay">
+    <div class="modal-box modal-wide">
+      <div class="modal-header">
+        <div>
+          <h3>Request Details</h3>
+          <p class="modal-sub" id="ar-sub"></p>
+        </div>
+        <button class="modal-close" onclick="closeModal('admin-request-modal')">✕</button>
+      </div>
+      <div class="modal-body" id="ar-body"></div>
     </div>
   </div>
 
