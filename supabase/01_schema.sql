@@ -377,10 +377,12 @@ create trigger requests_after_update after update on public.requests
 
 -- --------------------------------------------------------- test accounts
 -- The dummy admin and faculty accounts used for testing have no real mailbox, so they sign in
--- with a password instead of Google. Only addresses listed here may have a password account,
--- and only when created already confirmed (Supabase → Authentication → Users → Add user, with
--- "Auto Confirm User" ticked). A stranger signing up with a password is refused, so nobody can
--- claim a professor's or student's address. Delete these rows and users before real use.
+-- with a password instead of Google. Only addresses listed here may have a password account
+-- (create them in Supabase → Authentication → Users → Add user, with "Auto Confirm User" ticked),
+-- so nobody can claim a professor's or student's address with a password. Keep "Confirm email"
+-- ON under Authentication → Providers → Email: then a stranger who signs up with a listed address
+-- can never sign in, because the confirmation goes to a mailbox that doesn't exist.
+-- Delete these rows and users before real use.
 create table if not exists public.test_accounts (
   email       text primary key,
   note        text,
@@ -401,9 +403,9 @@ begin
   if lower(new.email) not like '%@email.iimcal.ac.in' then
     raise exception 'Only @email.iimcal.ac.in accounts can use this portal.';
   end if;
+  -- Supabase saves a new user first and marks it confirmed afterwards, so only the list is checked here
   if coalesce(new.raw_app_meta_data ->> 'provider', '') = 'email'
-     and (new.email_confirmed_at is null
-          or not exists (select 1 from public.test_accounts t where t.email = lower(new.email))) then
+     and not exists (select 1 from public.test_accounts t where t.email = lower(new.email)) then
     raise exception 'Password sign-in is only for the portal''s test accounts.';
   end if;
   insert into public.profiles (id, email, full_name)
