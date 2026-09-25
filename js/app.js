@@ -1257,8 +1257,6 @@ function openProfReview(id) {
     </div>
     <div class="detail-section">
       <h4>Questions to Re-Evaluate</h4>
-      <p class="qm-hint">Fill in every field under each question. The request counts as successful if the marks
-        change on any question, even if the total stays the same.</p>
       ${questionListHtml(r, { after: i => questionMarkFieldsHtml(marks[i]) })}
     </div>`;
 
