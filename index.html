@@ -310,29 +310,18 @@
           <hr class="divider" />
           <div class="review-section">
             <h4>Professor's Decision</h4>
+            <div class="review-outcome" id="p-outcome"></div>
             <div class="form-grid-2">
               <div class="form-group">
-                <label>Original Marks (per question) *</label>
-                <input type="text" id="p-original-marks" placeholder="e.g. Q2: 6/10, Q4: 10/15" />
-              </div>
-              <div class="form-group">
-                <label>Updated Marks (per question)</label>
-                <input type="text" id="p-marks" placeholder="e.g. Q2: 8/10, Q4: 12/15" />
-              </div>
-            </div>
-            <div class="form-grid-2">
-              <div class="form-group">
-                <label>Final Status</label>
-                <select id="p-status">
-                  <option value="Under Review">Under Review</option>
-                  <option value="Resolved - Marks Increased">Marks Increased</option>
-                  <option value="Resolved - Marks Decreased">Marks Decreased</option>
-                  <option value="Resolved - No Change">No Change</option>
+                <label>Status</label>
+                <select id="p-status" onchange="updateReviewOutcome()">
+                  <option value="Under Review">Still under review</option>
+                  <option value="final">Final — status follows from the marks</option>
                 </select>
               </div>
             </div>
             <div class="form-group">
-              <label>Explanation / Remarks *</label>
+              <label>Overall Explanation *</label>
               <textarea id="p-remarks" rows="4"
                 placeholder="Explain the reasoning for the mark change (or no change). This will be visible to the student."></textarea>
             </div>

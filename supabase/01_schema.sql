@@ -152,6 +152,9 @@ create table if not exists public.requests (
   status            text not null default 'Pending'
                     check (status in ('Pending','Under Review','Resolved - Marks Increased',
                                       'Resolved - Marks Decreased','Resolved - No Change')),
+  -- one entry per question: {question, original, max, updated, remark}; the two text
+  -- columns below are generated from it ("Q2: 6/10, Q4: 10/15")
+  question_marks    jsonb,
   original_marks    text,
   updated_marks     text,
   professor_remarks text,
@@ -162,6 +165,7 @@ create table if not exists public.requests (
 
 -- Added after the first release; brings an existing database up to date
 alter table public.requests add column if not exists original_marks text;
+alter table public.requests add column if not exists question_marks jsonb;
 
 create table if not exists public.question_items (
   id          uuid primary key default gen_random_uuid(),
@@ -254,6 +258,7 @@ begin
   new.exam_type   := w.exam_type;
   new.term        := w.term;
   new.status      := 'Pending';
+  new.question_marks := null;
   new.original_marks := null;
   new.updated_marks := null;
   new.professor_remarks := null;
@@ -286,9 +291,42 @@ begin
      or new.professor_names <> old.professor_names or new.reg_no <> old.reg_no then
     raise exception 'Only the marks, remarks and status of a request can change.';
   end if;
-  if coalesce(new.original_marks, '') = '' then
-    raise exception 'Original marks are required.';
+  -- Marks for every question, as numbers of 0 or more, never above "out of"
+  if jsonb_typeof(new.question_marks) is distinct from 'array'
+     or jsonb_array_length(new.question_marks)
+        <> (select count(*) from public.question_items qi where qi.request_id = new.id) then
+    raise exception 'Enter the marks for every question.';
   end if;
+  if exists (select 1 from jsonb_array_elements(new.question_marks) q
+              where jsonb_typeof(q -> 'original') is distinct from 'number'
+                 or (q ->> 'original')::numeric < 0
+                 or (jsonb_typeof(q -> 'updated') = 'number' and (q ->> 'updated')::numeric < 0)
+                 or (jsonb_typeof(q -> 'max') = 'number' and ((q ->> 'original')::numeric > (q ->> 'max')::numeric
+                     or (jsonb_typeof(q -> 'updated') = 'number' and (q ->> 'updated')::numeric > (q ->> 'max')::numeric)))) then
+    raise exception 'Original marks are required for every question, and no mark can be negative or above its maximum.';
+  end if;
+  -- A final decision needs every updated mark, and its status follows from the totals
+  if new.status like 'Resolved%' then
+    if exists (select 1 from jsonb_array_elements(new.question_marks) q
+                where jsonb_typeof(q -> 'updated') is distinct from 'number') then
+      raise exception 'Updated marks are required for every question before a final decision.';
+    end if;
+    select case sign(sum((q ->> 'updated')::numeric) - sum((q ->> 'original')::numeric))
+             when 1 then 'Resolved - Marks Increased'
+             when -1 then 'Resolved - Marks Decreased'
+             else 'Resolved - No Change' end
+      into new.status
+      from jsonb_array_elements(new.question_marks) q;
+  end if;
+  new.original_marks := (select string_agg((q ->> 'question') || ': ' || (q ->> 'original')
+                                  || coalesce('/' || (q ->> 'max'), ''), ', ' order by n)
+                           from jsonb_array_elements(new.question_marks) with ordinality as e(q, n));
+  new.updated_marks := case when exists (select 1 from jsonb_array_elements(new.question_marks) q
+                                           where jsonb_typeof(q -> 'updated') is distinct from 'number')
+                            then null
+                            else (select string_agg((q ->> 'question') || ': ' || (q ->> 'updated')
+                                         || coalesce('/' || (q ->> 'max'), ''), ', ' order by n)
+                                    from jsonb_array_elements(new.question_marks) with ordinality as e(q, n)) end;
   if coalesce(new.professor_remarks, '') = '' then
     raise exception 'Remarks are required.';
   end if;

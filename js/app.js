@@ -503,14 +503,16 @@ function photoUrl(requestId, photo) {
   return `/api/photos/${encodeURIComponent(requestId)}/${encodeURIComponent(name)}`;
 }
 
-function questionListHtml(r, { photos = true } = {}) {
+// `after(i)` adds content under question i: the marks fields, or the marks once decided
+function questionListHtml(r, { photos = true, after = () => '' } = {}) {
   // Older requests stored one questions string and one reason for all of them
   if (!Array.isArray(r.questionItems) || !r.questionItems.length) {
     return `
       <div class="detail-grid">
         <div class="detail-item detail-full"><label>Questions</label><span>${escapeHtml(r.questions || '—')}</span></div>
         ${r.reason ? `<div class="detail-item detail-full"><label>Reason</label><span style="white-space:pre-wrap">${escapeHtml(r.reason)}</span></div>` : ''}
-      </div>`;
+      </div>
+      ${after(0)}`;
   }
   return r.questionItems.map((q, i) => `
     <div class="q-view">
@@ -525,6 +527,7 @@ function questionListHtml(r, { photos = true } = {}) {
           <img src="${photoUrl(r.id, photo)}" alt="Photo of ${escapeHtml(q.question)}" loading="lazy" />
         </button>`).join('')}</div>` : ''}
       ${(photos && !(q.photos || []).length && q.photoCount) ? `<div class="q-view-gone">🗑️ ${q.photoCount} photo${q.photoCount === 1 ? '' : 's'} were deleted ${PHOTO_RETENTION_DAYS} days after this request was closed.</div>` : ''}
+      ${after(i)}
     </div>`).join('');
 }
 
@@ -893,10 +896,16 @@ function photoNoteHtml(r, inHistory, hadPhotos) {
 function decisionHtml(r, title = "Professor's Decision") {
   if (!r.originalMarks && !r.updatedMarks && !r.professorRemarks) return '';
   const boxClass = r.status.includes('Increased') ? '' : r.status.includes('Decreased') ? ' result-decreased' : ' result-nochange';
-  const marks = [
-    r.originalMarks ? `<div class="result-marks-row"><label>Original</label><span class="result-marks result-marks-original">${escapeHtml(r.originalMarks)}</span></div>` : '',
-    r.updatedMarks ? `<div class="result-marks-row"><label>Updated</label><span class="result-marks">${escapeHtml(r.updatedMarks)}</span></div>` : '',
-  ].join('');
+  const row = (label, value, cls = '') => `<div class="result-marks-row"><label>${label}</label><span class="result-marks${cls}">${escapeHtml(value)}</span></div>`;
+  let marks;
+  if (Array.isArray(r.questionMarks) && r.questionMarks.length) {
+    const t = marksTotals(r.questionMarks);
+    marks = row('Original total', markWithMax(t.original, t.max), ' result-marks-original') +
+      (t.updated != null ? row('Updated total', markWithMax(t.updated, t.max)) : '');
+  } else {
+    marks = (r.originalMarks ? row('Original', r.originalMarks, ' result-marks-original') : '') +
+      (r.updatedMarks ? row('Updated', r.updatedMarks) : '');
+  }
   return `
     <div class="result-box${boxClass}">
       <h5>${title}</h5>
@@ -931,7 +940,7 @@ function openStudentDetail(id) {
     </div>
     <div class="detail-section">
       <h4>Questions</h4>
-      ${questionListHtml(r, { photos: !inHistory })}
+      ${questionListHtml(r, { photos: !inHistory, after: marksAfter(r) })}
       ${photoNoteHtml(r, inHistory, hadPhotos)}
     </div>
     ${resultHtml}
@@ -1131,11 +1140,146 @@ function profCard(r) {
   </div>`;
 }
 
+// ===== MARKS PER QUESTION =====
+// The professor enters original and updated marks, and an optional remark, for every question.
+// The final status follows from the totals, so it can never disagree with the marks.
+// Stored as r.questionMarks = [{ question, original, max, updated, remark }], one per question, in order.
+let _reviewQuestions = [];   // question names of the request open in the review form
+
+// Older requests have one questions string instead of a list; they get a single group
+function reviewQuestionNames(r) {
+  if (Array.isArray(r.questionItems) && r.questionItems.length) return r.questionItems.map(q => q.question);
+  return [r.questions || 'All questions'];
+}
+
+function formatMark(n) {
+  return n == null ? '—' : String(Math.round(n * 100) / 100);
+}
+
+function markWithMax(n, max) {
+  return formatMark(n) + (max != null ? ' / ' + formatMark(max) : '');
+}
+
+// "Q2: 6/10, Q4: 10/15" — kept on the request for the CSV export and older screens
+function marksSummary(marks, key) {
+  if (!marks.length || marks.some(m => m[key] == null)) return null;
+  return marks.map(m => `${m.question}: ${formatMark(m[key])}${m.max != null ? '/' + formatMark(m.max) : ''}`).join(', ');
+}
+
+function marksTotals(marks) {
+  const sum = key => marks.reduce((t, m) => t + (m[key] || 0), 0);
+  return {
+    original: sum('original'),
+    updated: marks.every(m => m.updated != null) ? sum('updated') : null,
+    max: marks.every(m => m.max != null) ? sum('max') : null,
+  };
+}
+
+// Compared in hundredths so 0.1 + 0.2 doesn't count as a change
+function marksDifference(from, to) {
+  return (Math.round(to * 100) - Math.round(from * 100)) / 100;
+}
+
+function outcomeFromMarks(marks) {
+  const { original, updated } = marksTotals(marks);
+  if (updated == null) return null;
+  const diff = marksDifference(original, updated);
+  return diff > 0 ? 'Resolved - Marks Increased' : diff < 0 ? 'Resolved - Marks Decreased' : 'Resolved - No Change';
+}
+
+// The professor's fields under one question
+function questionMarkFieldsHtml(m = {}) {
+  const val = v => v == null ? '' : formatMark(v);
+  const field = (label, cls, value) => `
+    <label class="qm-field">${label}
+      <input type="number" class="${cls}" min="0" step="0.5" inputmode="decimal" value="${val(value)}" oninput="updateReviewOutcome()" />
+    </label>`;
+  return `
+    <div class="qm-fields">
+      <div class="qm-row">
+        ${field('Original marks *', 'qm-original', m.original)}
+        ${field('Out of', 'qm-max', m.max)}
+        ${field('Updated marks', 'qm-updated', m.updated)}
+      </div>
+      <label class="qm-field">Remark on this question
+        <input type="text" class="qm-remark" maxlength="1000" placeholder="Optional — visible to the student" value="${escapeHtml(m.remark || '')}" />
+      </label>
+    </div>`;
+}
+
+// The same marks, read-only, under each question on the student and admin screens
+function questionMarksViewHtml(m) {
+  if (!m) return '';
+  const dir = m.updated == null ? '' : m.updated > m.original ? ' qm-up' : m.updated < m.original ? ' qm-down' : '';
+  return `
+    <div class="qm-view">
+      <span class="qm-view-marks">Marks ${markWithMax(m.original, m.max)}${m.updated != null
+        ? ` → <strong class="qm-view-updated${dir}">${markWithMax(m.updated, m.max)}</strong>` : ''}</span>
+      ${m.remark ? `<div class="qm-view-remark">${escapeHtml(m.remark)}</div>` : ''}
+    </div>`;
+}
+
+function marksAfter(r) {
+  const marks = Array.isArray(r.questionMarks) ? r.questionMarks : [];
+  return i => questionMarksViewHtml(marks[i]);
+}
+
+function readReviewMarks() {
+  const num = el => el.value.trim() === '' ? null : Number(el.value);
+  return [...document.querySelectorAll('#prof-request-detail .qm-fields')].map((el, i) => ({
+    question: _reviewQuestions[i],
+    original: num(el.querySelector('.qm-original')),
+    max: num(el.querySelector('.qm-max')),
+    updated: num(el.querySelector('.qm-updated')),
+    remark: el.querySelector('.qm-remark').value.trim(),
+  }));
+}
+
+// An error message, or '' when the marks can be saved
+function checkReviewMarks(marks, final) {
+  const bad = v => v != null && (!Number.isFinite(v) || v < 0);
+  for (const m of marks) {
+    if (m.original == null) return `Enter the original marks for ${m.question}.`;
+    if (bad(m.original) || bad(m.max) || bad(m.updated)) return `Marks for ${m.question} must be numbers of 0 or more.`;
+    if (final && m.updated == null) return `Enter the updated marks for ${m.question} — the same as the original if they did not change.`;
+    if (m.max != null && (m.original > m.max || (m.updated != null && m.updated > m.max))) {
+      return `Marks for ${m.question} can't be more than ${formatMark(m.max)}.`;
+    }
+  }
+  return '';
+}
+
+// Live line under the form: the totals and the status they lead to
+function updateReviewOutcome() {
+  const el = document.getElementById('p-outcome');
+  const marks = readReviewMarks();
+  const final = document.getElementById('p-status').value === 'final';
+  el.className = 'review-outcome';
+  if (!marks.length || marks.some(m => m.original == null)) {
+    el.textContent = 'Enter the original marks for every question.';
+    return;
+  }
+  const t = marksTotals(marks);
+  let text = `Total ${markWithMax(t.original, t.max)}`;
+  if (t.updated != null) {
+    const diff = marksDifference(t.original, t.updated);
+    text += ` → ${markWithMax(t.updated, t.max)} (${diff > 0 ? '+' : ''}${formatMark(diff)})`;
+    if (diff) el.classList.add(diff > 0 ? 'review-outcome-up' : 'review-outcome-down');
+  }
+  const outcome = outcomeFromMarks(marks);
+  text += !final ? ' · Status stays Under Review'
+    : outcome ? ' · Final status: ' + outcome.replace('Resolved - ', '')
+    : ' · Enter updated marks for every question to finalise';
+  el.textContent = text;
+}
+
 function openProfReview(id) {
   currentProfRequestId = id;
   const r = getRequests().find(x => x.id === id);
   if (!r) return;
 
+  _reviewQuestions = reviewQuestionNames(r);
+  const marks = Array.isArray(r.questionMarks) ? r.questionMarks : [];
   document.getElementById('prof-modal-sub').textContent =
     `${r.studentName} · ${r.regNo} · Sec ${r.section || '—'} · ${r.subject} · Submitted ${formatDate(r.createdAt)}`;
 
@@ -1154,13 +1298,13 @@ function openProfReview(id) {
     </div>
     <div class="detail-section">
       <h4>Questions to Re-Evaluate</h4>
-      ${questionListHtml(r)}
+      <p class="qm-hint">Enter the marks for each question under it. Leave "Out of" empty if it doesn't apply.</p>
+      ${questionListHtml(r, { after: i => questionMarkFieldsHtml(marks[i]) })}
     </div>`;
 
-  document.getElementById('p-original-marks').value = r.originalMarks || '';
-  document.getElementById('p-marks').value = r.updatedMarks || '';
   document.getElementById('p-remarks').value = r.professorRemarks || '';
-  document.getElementById('p-status').value = r.status !== 'Pending' ? r.status : 'Under Review';
+  document.getElementById('p-status').value = r.status.startsWith('Resolved') ? 'final' : 'Under Review';
+  updateReviewOutcome();
 
   // Append read-only history timeline for faculty reference
   const existingTimeline = document.getElementById('prof-request-detail').querySelector('.history-timeline-wrap');
@@ -1173,12 +1317,13 @@ function openProfReview(id) {
 }
 
 async function submitProfReview() {
-  const originalMarks = document.getElementById('p-original-marks').value.trim();
-  const marks = document.getElementById('p-marks').value.trim();
+  const questionMarks = readReviewMarks();
+  const final = document.getElementById('p-status').value === 'final';
   const remarks = document.getElementById('p-remarks').value.trim();
-  const status = document.getElementById('p-status').value;
-  if (!originalMarks) { showToast('Please enter the original marks.', 'error'); return; }
-  if (!remarks) { showToast('Please enter remarks/explanation.', 'error'); return; }
+  const problem = checkReviewMarks(questionMarks, final);
+  if (problem) { showToast(problem, 'error'); return; }
+  if (!remarks) { showToast('Please enter the overall explanation.', 'error'); return; }
+  const status = final ? outcomeFromMarks(questionMarks) : 'Under Review';
 
   // Server mode: the server records the decision
   if (_serverMode) {
@@ -1188,7 +1333,7 @@ async function submitProfReview() {
     btn.textContent = 'Saving...';
     try {
       const r = await postRequestAction(currentProfRequestId, 'review', {
-        status, originalMarks, updatedMarks: marks, professorRemarks: remarks, by: currentUser.email,
+        status, questionMarks, professorRemarks: remarks, by: currentUser.email,
       });
       closeModal('prof-review-modal');
       renderProfStats();
@@ -1208,8 +1353,9 @@ async function submitProfReview() {
   if (idx === -1) return;
 
   const oldStatus = requests[idx].status;
-  requests[idx].originalMarks = originalMarks;
-  requests[idx].updatedMarks = marks || null;
+  requests[idx].questionMarks = questionMarks;
+  requests[idx].originalMarks = marksSummary(questionMarks, 'original');
+  requests[idx].updatedMarks = marksSummary(questionMarks, 'updated');
   requests[idx].professorRemarks = remarks;
   requests[idx].status = status;
   requests[idx].reviewedAt = Date.now();
@@ -2723,7 +2869,7 @@ function openAdminRequest(id) {
     </div>
     <div class="detail-section">
       <h4>Questions</h4>
-      ${questionListHtml(r)}
+      ${questionListHtml(r, { after: marksAfter(r) })}
     </div>
     ${decision}
     ${renderHistoryTimeline(r)}`;
