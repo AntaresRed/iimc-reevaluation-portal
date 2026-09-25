@@ -864,7 +864,7 @@ function studentCard(r) {
 }
 
 function getResultClass(status) {
-  if (status.includes('Increased')) return 'result-increased-alert';
+  if (status.includes('Increased') || status.includes('Changed')) return 'result-increased-alert';
   if (status.includes('Decreased')) return 'result-decreased-alert';
   return 'result-nochange-alert';
 }
@@ -874,6 +874,7 @@ function getBadge(status) {
   if (status === 'Under Review') return `<span class="badge badge-review">Under Review</span>`;
   if (status.includes('Increased')) return `<span class="badge badge-increased">Marks Up ↑</span>`;
   if (status.includes('Decreased')) return `<span class="badge badge-decreased">Marks Down ↓</span>`;
+  if (status.includes('Changed')) return `<span class="badge badge-increased">Marks Changed</span>`;
   return `<span class="badge badge-nochange">No Change</span>`;
 }
 
@@ -892,20 +893,15 @@ function photoNoteHtml(r, inHistory, hadPhotos) {
   return '';
 }
 
-// The professor's decision: original → updated marks, then the remarks
+// The professor's decision on older requests: original → updated marks, then the remarks.
+// Requests decided per question show their marks and remarks under each question instead.
 function decisionHtml(r, title = "Professor's Decision") {
+  if (Array.isArray(r.questionMarks) && r.questionMarks.length) return '';
   if (!r.originalMarks && !r.updatedMarks && !r.professorRemarks) return '';
-  const boxClass = r.status.includes('Increased') ? '' : r.status.includes('Decreased') ? ' result-decreased' : ' result-nochange';
+  const boxClass = r.status.includes('Decreased') ? ' result-decreased' : r.status === PAYABLE_STATUS ? ' result-nochange' : '';
   const row = (label, value, cls = '') => `<div class="result-marks-row"><label>${label}</label><span class="result-marks${cls}">${escapeHtml(value)}</span></div>`;
-  let marks;
-  if (Array.isArray(r.questionMarks) && r.questionMarks.length) {
-    const t = marksTotals(r.questionMarks);
-    marks = row('Original total', markWithMax(t.original, t.max), ' result-marks-original') +
-      (t.updated != null ? row('Updated total', markWithMax(t.updated, t.max)) : '');
-  } else {
-    marks = (r.originalMarks ? row('Original', r.originalMarks, ' result-marks-original') : '') +
-      (r.updatedMarks ? row('Updated', r.updatedMarks) : '');
-  }
+  const marks = (r.originalMarks ? row('Original', r.originalMarks, ' result-marks-original') : '') +
+    (r.updatedMarks ? row('Updated', r.updatedMarks) : '');
   return `
     <div class="result-box${boxClass}">
       <h5>${title}</h5>
@@ -1141,9 +1137,11 @@ function profCard(r) {
 }
 
 // ===== MARKS PER QUESTION =====
-// The professor enters original and updated marks, and an optional remark, for every question.
-// The final status follows from the totals, so it can never disagree with the marks.
-// Stored as r.questionMarks = [{ question, original, max, updated, remark }], one per question, in order.
+// For every question the professor enters the original and updated marks, whether they went up,
+// down or stayed the same, and a remark. A request whose marks changed on any question counts as
+// a successful re-evaluation ("Marks Changed"), even if the total is the same; otherwise "No Change".
+// Stored as r.questionMarks = [{ question, original, updated, result, remark }], one per question.
+const QUESTION_RESULTS = { increased: 'Increased', decreased: 'Decreased', unchanged: 'No change' };
 let _reviewQuestions = [];   // question names of the request open in the review form
 
 // Older requests have one questions string instead of a list; they get a single group
@@ -1156,65 +1154,69 @@ function formatMark(n) {
   return n == null ? '—' : String(Math.round(n * 100) / 100);
 }
 
-function markWithMax(n, max) {
-  return formatMark(n) + (max != null ? ' / ' + formatMark(max) : '');
-}
-
-// "Q2: 6/10, Q4: 10/15" — kept on the request for the CSV export and older screens
-function marksSummary(marks, key) {
-  if (!marks.length || marks.some(m => m[key] == null)) return null;
-  return marks.map(m => `${m.question}: ${formatMark(m[key])}${m.max != null ? '/' + formatMark(m.max) : ''}`).join(', ');
-}
-
-function marksTotals(marks) {
-  const sum = key => marks.reduce((t, m) => t + (m[key] || 0), 0);
-  return {
-    original: sum('original'),
-    updated: marks.every(m => m.updated != null) ? sum('updated') : null,
-    max: marks.every(m => m.max != null) ? sum('max') : null,
-  };
-}
-
 // Compared in hundredths so 0.1 + 0.2 doesn't count as a change
-function marksDifference(from, to) {
-  return (Math.round(to * 100) - Math.round(from * 100)) / 100;
+function resultFromMarks(original, updated) {
+  if (original == null || updated == null || !Number.isFinite(original) || !Number.isFinite(updated)) return '';
+  const diff = Math.round(updated * 100) - Math.round(original * 100);
+  return diff > 0 ? 'increased' : diff < 0 ? 'decreased' : 'unchanged';
 }
 
-function outcomeFromMarks(marks) {
-  const { original, updated } = marksTotals(marks);
-  if (updated == null) return null;
-  const diff = marksDifference(original, updated);
-  return diff > 0 ? 'Resolved - Marks Increased' : diff < 0 ? 'Resolved - Marks Decreased' : 'Resolved - No Change';
+// "Q2: 6, Q4: 10" and "Q2: 8 (Increased) — remark" — kept on the request for the CSV and history
+function marksSummary(marks, key) {
+  return marks.map(m => `${m.question}: ${formatMark(m[key])}`).join(', ');
+}
+
+function remarksSummary(marks) {
+  return marks.map(m => `${m.question} (${QUESTION_RESULTS[m.result]}): ${m.remark}`).join('\n');
+}
+
+function statusFromMarks(marks) {
+  return marks.some(m => m.result !== 'unchanged') ? 'Resolved - Marks Changed' : 'Resolved - No Change';
 }
 
 // The professor's fields under one question
 function questionMarkFieldsHtml(m = {}) {
   const val = v => v == null ? '' : formatMark(v);
-  const field = (label, cls, value) => `
+  const number = (label, cls, value) => `
     <label class="qm-field">${label}
-      <input type="number" class="${cls}" min="0" step="0.5" inputmode="decimal" value="${val(value)}" oninput="updateReviewOutcome()" />
+      <input type="number" class="${cls}" min="0" step="0.5" inputmode="decimal" value="${val(value)}" oninput="onReviewMarksInput(this)" />
     </label>`;
   return `
     <div class="qm-fields">
       <div class="qm-row">
-        ${field('Original marks *', 'qm-original', m.original)}
-        ${field('Out of', 'qm-max', m.max)}
-        ${field('Updated marks', 'qm-updated', m.updated)}
+        ${number('Original marks *', 'qm-original', m.original)}
+        ${number('Updated marks *', 'qm-updated', m.updated)}
+        <label class="qm-field">Result *
+          <select class="qm-result">
+            <option value="">Select…</option>
+            ${Object.entries(QUESTION_RESULTS).map(([value, label]) =>
+              `<option value="${value}" ${m.result === value ? 'selected' : ''}>${label}</option>`).join('')}
+          </select>
+        </label>
       </div>
-      <label class="qm-field">Remark on this question
-        <input type="text" class="qm-remark" maxlength="1000" placeholder="Optional — visible to the student" value="${escapeHtml(m.remark || '')}" />
+      <label class="qm-field">Remark on this question *
+        <textarea class="qm-remark" rows="2" maxlength="1000" placeholder="Explain the marks for this question. Visible to the student.">${escapeHtml(m.remark || '')}</textarea>
       </label>
     </div>`;
+}
+
+// Typing the marks fills in the result; the professor can still change it, but not to one the marks contradict
+function onReviewMarksInput(input) {
+  const group = input.closest('.qm-fields');
+  const num = el => el.value.trim() === '' ? null : Number(el.value);
+  const result = resultFromMarks(num(group.querySelector('.qm-original')), num(group.querySelector('.qm-updated')));
+  if (result) group.querySelector('.qm-result').value = result;
 }
 
 // The same marks, read-only, under each question on the student and admin screens
 function questionMarksViewHtml(m) {
   if (!m) return '';
-  const dir = m.updated == null ? '' : m.updated > m.original ? ' qm-up' : m.updated < m.original ? ' qm-down' : '';
+  const cls = { increased: ' qm-up', decreased: ' qm-down' }[m.result] || '';
   return `
     <div class="qm-view">
-      <span class="qm-view-marks">Marks ${markWithMax(m.original, m.max)}${m.updated != null
-        ? ` → <strong class="qm-view-updated${dir}">${markWithMax(m.updated, m.max)}</strong>` : ''}</span>
+      <span class="qm-view-marks">Marks ${formatMark(m.original)}${m.updated != null
+        ? ` → <strong class="qm-view-updated${cls}">${formatMark(m.updated)}</strong>` : ''}</span>
+      ${m.result ? `<span class="qm-view-result${cls}">${QUESTION_RESULTS[m.result]}</span>` : ''}
       ${m.remark ? `<div class="qm-view-remark">${escapeHtml(m.remark)}</div>` : ''}
     </div>`;
 }
@@ -1229,48 +1231,26 @@ function readReviewMarks() {
   return [...document.querySelectorAll('#prof-request-detail .qm-fields')].map((el, i) => ({
     question: _reviewQuestions[i],
     original: num(el.querySelector('.qm-original')),
-    max: num(el.querySelector('.qm-max')),
     updated: num(el.querySelector('.qm-updated')),
+    result: el.querySelector('.qm-result').value,
     remark: el.querySelector('.qm-remark').value.trim(),
   }));
 }
 
 // An error message, or '' when the marks can be saved
-function checkReviewMarks(marks, final) {
-  const bad = v => v != null && (!Number.isFinite(v) || v < 0);
+function checkReviewMarks(marks) {
+  const bad = v => !Number.isFinite(v) || v < 0;
   for (const m of marks) {
     if (m.original == null) return `Enter the original marks for ${m.question}.`;
-    if (bad(m.original) || bad(m.max) || bad(m.updated)) return `Marks for ${m.question} must be numbers of 0 or more.`;
-    if (final && m.updated == null) return `Enter the updated marks for ${m.question} — the same as the original if they did not change.`;
-    if (m.max != null && (m.original > m.max || (m.updated != null && m.updated > m.max))) {
-      return `Marks for ${m.question} can't be more than ${formatMark(m.max)}.`;
+    if (m.updated == null) return `Enter the updated marks for ${m.question} — the same as the original if they did not change.`;
+    if (bad(m.original) || bad(m.updated)) return `Marks for ${m.question} must be numbers of 0 or more.`;
+    if (!m.result) return `Choose whether the marks for ${m.question} increased, decreased or stayed the same.`;
+    if (m.result !== resultFromMarks(m.original, m.updated)) {
+      return `For ${m.question} you chose "${QUESTION_RESULTS[m.result]}", but the marks go from ${formatMark(m.original)} to ${formatMark(m.updated)}.`;
     }
+    if (!m.remark) return `Enter a remark for ${m.question}.`;
   }
   return '';
-}
-
-// Live line under the form: the totals and the status they lead to
-function updateReviewOutcome() {
-  const el = document.getElementById('p-outcome');
-  const marks = readReviewMarks();
-  const final = document.getElementById('p-status').value === 'final';
-  el.className = 'review-outcome';
-  if (!marks.length || marks.some(m => m.original == null)) {
-    el.textContent = 'Enter the original marks for every question.';
-    return;
-  }
-  const t = marksTotals(marks);
-  let text = `Total ${markWithMax(t.original, t.max)}`;
-  if (t.updated != null) {
-    const diff = marksDifference(t.original, t.updated);
-    text += ` → ${markWithMax(t.updated, t.max)} (${diff > 0 ? '+' : ''}${formatMark(diff)})`;
-    if (diff) el.classList.add(diff > 0 ? 'review-outcome-up' : 'review-outcome-down');
-  }
-  const outcome = outcomeFromMarks(marks);
-  text += !final ? ' · Status stays Under Review'
-    : outcome ? ' · Final status: ' + outcome.replace('Resolved - ', '')
-    : ' · Enter updated marks for every question to finalise';
-  el.textContent = text;
 }
 
 function openProfReview(id) {
@@ -1298,13 +1278,11 @@ function openProfReview(id) {
     </div>
     <div class="detail-section">
       <h4>Questions to Re-Evaluate</h4>
-      <p class="qm-hint">Enter the marks for each question under it. Leave "Out of" empty if it doesn't apply.</p>
+      <p class="qm-hint">Fill in every field under each question. The request counts as successful if the marks
+        change on any question, even if the total stays the same.</p>
       ${questionListHtml(r, { after: i => questionMarkFieldsHtml(marks[i]) })}
     </div>`;
 
-  document.getElementById('p-remarks').value = r.professorRemarks || '';
-  document.getElementById('p-status').value = r.status.startsWith('Resolved') ? 'final' : 'Under Review';
-  updateReviewOutcome();
 
   // Append read-only history timeline for faculty reference
   const existingTimeline = document.getElementById('prof-request-detail').querySelector('.history-timeline-wrap');
@@ -1318,12 +1296,10 @@ function openProfReview(id) {
 
 async function submitProfReview() {
   const questionMarks = readReviewMarks();
-  const final = document.getElementById('p-status').value === 'final';
-  const remarks = document.getElementById('p-remarks').value.trim();
-  const problem = checkReviewMarks(questionMarks, final);
+  const problem = checkReviewMarks(questionMarks);
   if (problem) { showToast(problem, 'error'); return; }
-  if (!remarks) { showToast('Please enter the overall explanation.', 'error'); return; }
-  const status = final ? outcomeFromMarks(questionMarks) : 'Under Review';
+  const status = statusFromMarks(questionMarks);
+  const remarks = remarksSummary(questionMarks);
 
   // Server mode: the server records the decision
   if (_serverMode) {
@@ -1333,7 +1309,7 @@ async function submitProfReview() {
     btn.textContent = 'Saving...';
     try {
       const r = await postRequestAction(currentProfRequestId, 'review', {
-        status, questionMarks, professorRemarks: remarks, by: currentUser.email,
+        questionMarks, by: currentUser.email,
       });
       closeModal('prof-review-modal');
       renderProfStats();
@@ -2402,8 +2378,7 @@ function profileSummary(all) {
   return {
     total: all.length,
     pending: all.filter(r => r.status === 'Pending' || r.status === 'Under Review').length,
-    increased: all.filter(r => r.status === 'Resolved - Marks Increased').length,
-    decreased: all.filter(r => r.status === 'Resolved - Marks Decreased').length,
+    changed: all.filter(r => r.status.startsWith('Resolved') && r.status !== PAYABLE_STATUS).length,
     payable: all.filter(isFeePayable).length,
   };
 }
@@ -2411,6 +2386,7 @@ function profileSummary(all) {
 function outcomeLabel(status) {
   if (status === 'Resolved - Marks Increased') return { text: 'Marks increased', cls: 'out-up', fee: 'No fee' };
   if (status === 'Resolved - Marks Decreased') return { text: 'Marks decreased', cls: 'out-down', fee: 'No fee' };
+  if (status === 'Resolved - Marks Changed') return { text: 'Marks changed', cls: 'out-up', fee: 'No fee' };
   if (status === PAYABLE_STATUS) return { text: 'No change', cls: 'out-same', fee: 'Fee payable' };
   return { text: status, cls: 'out-open', fee: '—' };
 }
@@ -2467,8 +2443,7 @@ function renderStudentProfile() {
     <div class="stats-row">
       <div class="stat-card"><div class="stat-number">${s.total}</div><div class="stat-label">Applied</div></div>
       <div class="stat-card"><div class="stat-number">${s.pending}</div><div class="stat-label">Awaiting Result</div></div>
-      <div class="stat-card"><div class="stat-number">${s.increased}</div><div class="stat-label">Marks Increased</div></div>
-      <div class="stat-card"><div class="stat-number">${s.decreased}</div><div class="stat-label">Marks Decreased</div></div>
+      <div class="stat-card"><div class="stat-number">${s.changed}</div><div class="stat-label">Marks Changed</div></div>
       <div class="stat-card"><div class="stat-number">${s.payable}</div><div class="stat-label">No Change</div></div>
     </div>
 
@@ -2794,7 +2769,9 @@ function filteredAdminRequests() {
   const term = document.getElementById('req-term').value;
   const windowIds = new Set(getWindows().map(w => w.id));
   return getRequests().filter(r =>
-    (!status || (status === 'resolved' ? r.status.startsWith('Resolved') : r.status === status)) &&
+    (!status || (status === 'resolved' ? r.status.startsWith('Resolved')
+      : status === 'changed' ? r.status.startsWith('Resolved') && r.status !== PAYABLE_STATUS
+      : r.status === status)) &&
     (!windowId || (windowId === 'none' ? !windowIds.has(r.windowId) : r.windowId === windowId)) &&
     (!term || r.term === term) &&
     (!search || [r.studentName, r.studentEmail, r.regNo, r.subject, r.courseCode, r.professorName, r.id]

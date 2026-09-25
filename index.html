@@ -307,28 +307,9 @@
         </div>
         <div class="modal-body">
           <div id="prof-request-detail"></div>
-          <hr class="divider" />
-          <div class="review-section">
-            <h4>Professor's Decision</h4>
-            <div class="review-outcome" id="p-outcome"></div>
-            <div class="form-grid-2">
-              <div class="form-group">
-                <label>Status</label>
-                <select id="p-status" onchange="updateReviewOutcome()">
-                  <option value="Under Review">Still under review</option>
-                  <option value="final">Final — status follows from the marks</option>
-                </select>
-              </div>
-            </div>
-            <div class="form-group">
-              <label>Overall Explanation *</label>
-              <textarea id="p-remarks" rows="4"
-                placeholder="Explain the reasoning for the mark change (or no change). This will be visible to the student."></textarea>
-            </div>
-            <div class="form-actions">
-              <button type="button" class="btn-secondary" onclick="closeModal('prof-review-modal')">Cancel</button>
-              <button type="button" class="btn-primary" onclick="submitProfReview()">Save Decision</button>
-            </div>
+          <div class="form-actions">
+            <button type="button" class="btn-secondary" onclick="closeModal('prof-review-modal')">Cancel</button>
+            <button type="button" class="btn-primary" onclick="submitProfReview()">Submit Decision</button>
           </div>
         </div>
       </div>
@@ -392,8 +373,7 @@
             <option value="Pending">Pending</option>
             <option value="Under Review">Under Review</option>
             <option value="resolved">Resolved (any)</option>
-            <option value="Resolved - Marks Increased">Marks increased</option>
-            <option value="Resolved - Marks Decreased">Marks decreased</option>
+            <option value="changed">Marks changed</option>
             <option value="Resolved - No Change">No change</option>
           </select>
           <select id="req-window" onchange="renderAdminRequests()"></select>
@@ -498,8 +478,8 @@
               <div class="prof-new" id="w-prof-new" hidden>
                 <div class="prof-new-title">Add a new professor</div>
                 <div class="form-grid-2">
-                  <input type="text" id="w-prof-new-name" maxlength="120" placeholder="Full name, e.g. Prof. Amit Sen" onkeydown="onNewProfKeydown(event)" />
-                  <input type="email" id="w-prof-new-email" maxlength="200" placeholder="name@email.iimcal.ac.in" onkeydown="onNewProfKeydown(event)" />
+                  <input type="text" id="w-prof-new-name" maxlength="120" placeholder="Full name * (e.g. Prof. Amit Sen)" onkeydown="onNewProfKeydown(event)" />
+                  <input type="email" id="w-prof-new-email" maxlength="200" placeholder="Email * (name@email.iimcal.ac.in)" onkeydown="onNewProfKeydown(event)" />
                 </div>
                 <div class="prof-new-actions">
                   <span class="section-picker-hint">They can then sign in with this email to review requests.</span>
@@ -555,14 +535,15 @@
           </div>
           <div class="form-grid-2">
             <div class="form-group">
-              <label>Student Email</label>
+              <label>Student Email *</label>
               <input type="text" id="b-email" maxlength="200" placeholder="name@email.iimcal.ac.in" />
             </div>
             <div class="form-group">
-              <label>Registration Number</label>
+              <label>Registration Number *</label>
               <input type="text" id="b-regno" maxlength="40" placeholder="e.g. MBA/0042/62" />
             </div>
           </div>
+          <div class="section-picker-hint b-either-hint">* Enter at least one of these two.</div>
           <div class="form-group">
             <label>Reason *</label>
             <textarea id="b-reason" rows="3" maxlength="500" required oninput="updateDeactivateButton()"
@@ -570,7 +551,7 @@
           </div>
           <label class="checkbox-inline">
             <input type="checkbox" id="b-confirm" onchange="updateDeactivateButton()" />
-            I confirm this student should no longer be able to apply for re-evaluation.
+            I confirm this student should no longer be able to apply for re-evaluation. *
           </label>
           <div class="form-actions">
             <button type="button" class="btn-secondary" onclick="closeModal('block-modal')">Cancel</button>

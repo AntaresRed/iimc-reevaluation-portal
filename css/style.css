@@ -1863,7 +1863,7 @@ body.theme-sage .file-upload-area.has-file {
 .qm-fields { margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); display: grid; gap: 10px; }
 .qm-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
 .qm-field { display: grid; gap: 4px; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-secondary); }
-.qm-field input {
+.qm-field input, .qm-field select, .qm-field textarea {
   width: 100%;
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -1876,24 +1876,16 @@ body.theme-sage .file-upload-area.has-file {
   letter-spacing: 0;
   color: var(--text-primary);
   outline: none;
+  resize: vertical;
 }
-.qm-field input:focus { border-color: var(--iim-brown); box-shadow: 0 0 0 3px rgba(93,46,12,0.1); }
-.review-outcome {
-  background: var(--bg-surface);
-  border-radius: var(--radius-md);
-  padding: 10px 14px;
-  margin-bottom: 14px;
-  font-size: 14px;
-  font-weight: 700;
-  color: var(--text-secondary);
-}
-.review-outcome-up { color: var(--success); background: var(--success-bg); }
-.review-outcome-down { color: var(--danger); background: var(--danger-bg); }
+.qm-field input:focus, .qm-field select:focus, .qm-field textarea:focus { border-color: var(--iim-brown); box-shadow: 0 0 0 3px rgba(93,46,12,0.1); }
 .qm-view { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); font-size: 14px; color: var(--text-secondary); }
 .qm-view-updated { color: var(--text-primary); }
-.qm-view-updated.qm-up { color: var(--success); }
-.qm-view-updated.qm-down { color: var(--danger); }
+.qm-view-result { margin-left: 10px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); }
+.qm-up { color: var(--success); }
+.qm-down { color: var(--danger); }
 .qm-view-remark { margin-top: 4px; font-size: 13px; color: var(--text-primary); white-space: pre-wrap; }
+.b-either-hint { margin: -6px 0 12px; }
 @media (max-width: 520px) {
   .qm-row { grid-template-columns: 1fr 1fr; }
 }

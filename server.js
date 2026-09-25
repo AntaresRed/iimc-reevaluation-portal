@@ -775,15 +775,24 @@ function saveAndArchive(data) {
   archiveRequests(data.requests);
 }
 
-// Marks per question: [{ question, original, max, updated, remark }], one per question in order.
-// A final decision's status is worked out from the totals, whatever the browser sent.
+// Marks per question: [{ question, original, updated, result, remark }], one per question in order.
+// A request whose marks moved on any question is a successful re-evaluation ("Marks Changed"),
+// even if the total is the same. The status is worked out here, whatever the browser sent.
+const QUESTION_RESULTS = { increased: 'Increased', decreased: 'Decreased', unchanged: 'No change' };
+
 function cleanMark(value) {
   if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : NaN;
 }
 
-function readQuestionMarks(request, raw, final) {
+// Compared in hundredths so 0.1 + 0.2 doesn't count as a change
+function resultFromMarks(original, updated) {
+  const diff = Math.round(updated * 100) - Math.round(original * 100);
+  return diff > 0 ? 'increased' : diff < 0 ? 'decreased' : 'unchanged';
+}
+
+function readQuestionMarks(request, raw) {
   const names = Array.isArray(request.questionItems) && request.questionItems.length
     ? request.questionItems.map(q => q.question)
     : [request.questions || 'All questions'];
@@ -793,35 +802,27 @@ function readQuestionMarks(request, raw, final) {
     const m = {
       question: names[i],
       original: cleanMark(item && item.original),
-      max: cleanMark(item && item.max),
       updated: cleanMark(item && item.updated),
+      result: String((item && item.result) || ''),
       remark: cleanText(item && item.remark, 1000),
     };
-    if (m.original == null) return { error: `Original marks are required for ${m.question}.` };
-    if ([m.original, m.max, m.updated].some(Number.isNaN)) return { error: `Marks for ${m.question} must be numbers of 0 or more.` };
-    if (final && m.updated == null) return { error: `Updated marks are required for ${m.question}.` };
-    if (m.max != null && (m.original > m.max || (m.updated != null && m.updated > m.max))) {
-      return { error: `Marks for ${m.question} can't be more than ${m.max}.` };
+    if (m.original == null || m.updated == null) return { error: `Original and updated marks are required for ${m.question}.` };
+    if (Number.isNaN(m.original) || Number.isNaN(m.updated)) return { error: `Marks for ${m.question} must be numbers of 0 or more.` };
+    if (!Object.prototype.hasOwnProperty.call(QUESTION_RESULTS, m.result)) {
+      return { error: `Choose whether the marks for ${m.question} increased, decreased or stayed the same.` };
     }
+    if (m.result !== resultFromMarks(m.original, m.updated)) return { error: `The result chosen for ${m.question} doesn't match its marks.` };
+    if (!m.remark) return { error: `A remark is required for ${m.question}.` };
     marks.push(m);
   }
   return { marks };
 }
 
 function marksSummary(marks, key) {
-  if (marks.some(m => m[key] == null)) return null;
-  return marks.map(m => `${m.question}: ${m[key]}${m.max != null ? '/' + m.max : ''}`).join(', ');
-}
-
-function outcomeFromMarks(marks) {
-  const total = key => marks.reduce((t, m) => t + Math.round(m[key] * 100), 0);
-  const diff = total('updated') - total('original');
-  return diff > 0 ? 'Resolved - Marks Increased' : diff < 0 ? 'Resolved - Marks Decreased' : 'Resolved - No Change';
+  return marks.map(m => `${m.question}: ${m[key]}`).join(', ');
 }
 
 // POST /api/requests/:id/review — the professor's decision
-const REVIEW_STATUSES = ['Under Review', 'Resolved - Marks Increased', 'Resolved - Marks Decreased', 'Resolved - No Change'];
-
 async function handleRequestActions(req, res) {
   const m = req.url.match(/^\/api\/requests\/([^/]+)\/review$/);
   if (!m || req.method !== 'POST') return false;
@@ -833,14 +834,10 @@ async function handleRequestActions(req, res) {
     const request = findRequest(data, id);
     if (!request) { sendJson(res, 404, { error: 'Request not found.' }); return true; }
 
-    let status = String(body.status || '');
-    if (!REVIEW_STATUSES.includes(status)) { sendJson(res, 400, { error: 'Invalid status.' }); return true; }
-    const remarks = String(body.professorRemarks || '').trim().slice(0, 5000);
-    if (!remarks) { sendJson(res, 400, { error: 'Remarks are required.' }); return true; }
-    const final = status.startsWith('Resolved');
-    const { marks, error } = readQuestionMarks(request, body.questionMarks, final);
+    const { marks, error } = readQuestionMarks(request, body.questionMarks);
     if (error) { sendJson(res, 400, { error }); return true; }
-    if (final) status = outcomeFromMarks(marks);
+    const status = marks.some(m => m.result !== 'unchanged') ? 'Resolved - Marks Changed' : 'Resolved - No Change';
+    const remarks = marks.map(m => `${m.question} (${QUESTION_RESULTS[m.result]}): ${m.remark}`).join('\n');
 
     const oldStatus = request.status;
     const by = cleanText(body.by, 200) || '—';
